@@ -1,0 +1,84 @@
+{
+  "items": [
+    { "type": "DETECTIVE", "name": "D_HQW", "description": "Harley Quin Wildcard" },
+    { "type": "DETECTIVE", "name": "D_HQW", "description": "Harley Quin Wildcard" },
+    { "type": "DETECTIVE", "name": "D_HQW", "description": "Harley Quin Wildcard" },
+    { "type": "DETECTIVE", "name": "D_HQW", "description": "Harley Quin Wildcard" },
+
+    { "type": "DETECTIVE", "name": "D_AO", "description": "Ariadne Oliver" },
+    { "type": "DETECTIVE", "name": "D_AO", "description": "Ariadne Oliver" },
+    { "type": "DETECTIVE", "name": "D_AO", "description": "Ariadne Oliver" },
+
+    { "type": "DETECTIVE", "name": "D_MM", "description": "Miss Marple" },
+    { "type": "DETECTIVE", "name": "D_MM", "description": "Miss Marple" },
+    { "type": "DETECTIVE", "name": "D_MM", "description": "Miss Marple" },
+
+    { "type": "DETECTIVE", "name": "D_PP", "description": "Parker Pyne" },
+    { "type": "DETECTIVE", "name": "D_PP", "description": "Parker Pyne" },
+    { "type": "DETECTIVE", "name": "D_PP", "description": "Parker Pyne" },
+
+    { "type": "DETECTIVE", "name": "D_TB", "description": "Tommy Beresford" },
+    { "type": "DETECTIVE", "name": "D_TB", "description": "Tommy Beresford" },
+
+    { "type": "DETECTIVE", "name": "D_LEB", "description": "Lady Eileen Brent" },
+    { "type": "DETECTIVE", "name": "D_LEB", "description": "Lady Eileen Brent" },
+    { "type": "DETECTIVE", "name": "D_LEB", "description": "Lady Eileen Brent" },
+
+    { "type": "DETECTIVE", "name": "D_TUB", "description": "Tuppence Beresford" },
+    { "type": "DETECTIVE", "name": "D_TUB", "description": "Tuppence Beresford" },
+
+    { "type": "DETECTIVE", "name": "D_HP", "description": "Hercule Poirot" },
+    { "type": "DETECTIVE", "name": "D_HP", "description": "Hercule Poirot" },
+    { "type": "DETECTIVE", "name": "D_HP", "description": "Hercule Poirot" },
+
+    { "type": "DETECTIVE", "name": "D_MS", "description": "Mr. Satterthwaite" },
+    { "type": "DETECTIVE", "name": "D_MS", "description": "Mr. Satterthwaite" },
+
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+    { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
+
+    { "type": "DEVIOUS", "name": "DV_BLM", "description": "Blackmailed!" },
+    { "type": "DEVIOUS", "name": "DV_SFP", "description": "Social Faux Pas" },
+    { "type": "DEVIOUS", "name": "DV_SFP", "description": "Social Faux Pas" },
+    { "type": "DEVIOUS", "name": "DV_SFP", "description": "Social Faux Pas" },
+
+    { "type": "EVENT", "name": "E_DME", "description": "Delay the Murderer's Escape" },
+    { "type": "EVENT", "name": "E_DME", "description": "Delay the Murderer's Escape" },
+    { "type": "EVENT", "name": "E_DME", "description": "Delay the Murderer's Escape" },
+
+    { "type": "EVENT", "name": "E_PYS", "description": "Point your Suspicions" },
+    { "type": "EVENT", "name": "E_PYS", "description": "Point your Suspicions" },
+    { "type": "EVENT", "name": "E_PYS", "description": "Point your Suspicions" },
+
+    { "type": "EVENT", "name": "E_DCF", "description": "Dead Card Folly" },
+    { "type": "EVENT", "name": "E_DCF", "description": "Dead Card Folly" },
+    { "type": "EVENT", "name": "E_DCF", "description": "Dead Card Folly" },
+
+    { "type": "EVENT", "name": "E_AV", "description": "Another Victim" },
+    { "type": "EVENT", "name": "E_AV", "description": "Another Victim" },
+
+    { "type": "EVENT", "name": "E_LIA", "description": "Look into the Ashes" },
+    { "type": "EVENT", "name": "E_LIA", "description": "Look into the Ashes" },
+    { "type": "EVENT", "name": "E_LIA", "description": "Look into the Ashes" },
+
+    { "type": "EVENT", "name": "E_CT", "description": "Card Trade" },
+    { "type": "EVENT", "name": "E_CT", "description": "Card Trade" },
+    { "type": "EVENT", "name": "E_CT", "description": "Card Trade" },
+
+    { "type": "EVENT", "name": "E_ATWOM", "description": "And then there was one more" },
+    { "type": "EVENT", "name": "E_ATWOM", "description": "And then there was one more" },
+
+    { "type": "EVENT", "name": "E_ETP", "description": "Early train to Paddington" },
+    { "type": "EVENT", "name": "E_ETP", "description": "Early train to Paddington" },
+
+    { "type": "EVENT", "name": "E_COT", "description": "Cards off the Table" }
+  ]
+}
