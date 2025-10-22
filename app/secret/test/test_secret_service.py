@@ -1,7 +1,7 @@
 import pytest
 import uuid
 import json
-from unittest.mock import mock_open
+from unittest.mock import mock_open, MagicMock
 from datetime import date
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -12,6 +12,8 @@ from app.secret.service import SecretService
 from app.secret.models import Secrets
 from app.secret.enums import SecretType
 from app.player.models import Player
+import app.card.models  # noqa: F401
+from app.player.service import PlayerService
 from app.game.models import Game
 
 
@@ -178,6 +180,34 @@ def test_change_secret_status_toggles_revealed_flag(db_session, sample_game_and_
     assert updated_dto.revealed is not initial_state
 
 
+def test_change_secret_status_updates_social_disgrace(db_session):
+    player = Player(id=uuid.uuid4(), name="Jugador", birthday=date(1990, 1, 1))
+    db_session.add(player)
+    db_session.commit()
+
+    secret = Secrets(
+        id=uuid.uuid4(),
+        name="Chisme",
+        game_id=uuid.uuid4(),
+        role=SecretType.COMMON,
+        description="KETI",
+        owner_player_id=player.id,
+        revealed=False
+    )
+    db_session.add(secret)
+    db_session.commit()
+
+    dto = SecretService.change_secret_status(db_session, secret.id)
+    player_refreshed = db_session.query(Player).filter_by(id=player.id).one()
+    assert dto.revealed is True
+    assert player_refreshed.social_disgrace is True
+
+    dto_back = SecretService.change_secret_status(db_session, secret.id)
+    player_refreshed = db_session.query(Player).filter_by(id=player.id).one()
+    assert dto_back.revealed is False
+    assert player_refreshed.social_disgrace is False
+
+
 def test_move_secret_updates_owner(db_session, sample_game_and_players):
     """Debe poder cambiar el dueño de un secreto y persistir el cambio."""
     game, players = sample_game_and_players
@@ -191,6 +221,38 @@ def test_move_secret_updates_owner(db_session, sample_game_and_players):
 
     assert updated_dto is not None
     assert updated_dto.owner_player_id == new_owner
+
+
+def test_move_secret_updates_social_disgrace_for_owners(db_session):
+    player_from = Player(id=uuid.uuid4(), name="Origen", birthday=date(1990, 1, 1))
+    player_to = Player(id=uuid.uuid4(), name="Destino", birthday=date(1991, 2, 2))
+    db_session.add_all([player_from, player_to])
+    db_session.commit()
+
+    secret = Secrets(
+        id=uuid.uuid4(),
+        name="Contraseña",
+        game_id=uuid.uuid4(),
+        role=SecretType.COMMON,
+        description="MessiGOAT",
+        owner_player_id=player_from.id,
+        revealed=True,
+    )
+    db_session.add(secret)
+    db_session.commit()
+
+    PlayerService.update_social_disgrace(db_session, player_from.id)
+    db_session.flush()
+    db_session.refresh(player_from)
+    assert player_from.social_disgrace is True
+
+    SecretService.move_secret(db_session, secret.id, player_to.id)
+
+    refreshed_from = db_session.query(Player).filter_by(id=player_from.id).one()
+    refreshed_to = db_session.query(Player).filter_by(id=player_to.id).one()
+
+    assert refreshed_from.social_disgrace is True
+    assert refreshed_to.social_disgrace is True
 
 
 def test_change_secret_status_error_if_not_found(db_session):
@@ -300,3 +362,52 @@ def test_deal_secrets_rerolls_on_invalid_hand(db_session, mocker):
     SecretService.deal_secrets(db_session, game_id, player_ids)
 
     assert mock_shuffle.call_count > 1, "La función no reintentó la repartición ante una mano inválida."
+
+def test_get_murderer_team_ids(db_session):
+    game_id = uuid.uuid4()
+    murderer_id = uuid.uuid4()
+    accomplice_id = uuid.uuid4()
+
+    mock_query_result = [
+        (murderer_id,),
+        (accomplice_id,),
+        (None,)
+    ]
+
+    db_session.query = MagicMock()
+    mock_query_obj = db_session.query.return_value
+
+    mock_query_obj.filter.return_value = mock_query_obj
+    mock_query_obj.all.return_value = mock_query_result
+
+    result_ids = SecretService.get_murderer_team_ids(db_session, game_id)
+
+    db_session.query.assert_called_once_with(Secrets.owner_player_id)
+    mock_query_obj.filter.assert_called_once()
+    mock_query_obj.all.assert_called_once()
+
+    assert isinstance(result_ids, set)
+    assert result_ids == {murderer_id, accomplice_id}
+
+def test_get_murderer_team_ids_no_accomplice(db_session):
+    game_id = uuid.uuid4()
+    murderer_id = uuid.uuid4()
+    
+    mock_query_result = [(murderer_id,)]
+    db_session.query = MagicMock()
+    db_session.query.return_value.filter.return_value.all.return_value = mock_query_result
+
+    result_ids = SecretService.get_murderer_team_ids(db_session, game_id)
+
+    assert result_ids == {murderer_id}
+
+def test_get_murderer_team_ids_no_team(db_session):
+    game_id = uuid.uuid4()
+    
+    mock_query_result = []
+    db_session.query = MagicMock()
+    db_session.query.return_value.filter.return_value.all.return_value = mock_query_result
+
+    result_ids = SecretService.get_murderer_team_ids(db_session, game_id)
+
+    assert result_ids == set()

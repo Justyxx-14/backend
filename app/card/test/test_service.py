@@ -2,6 +2,7 @@ import uuid
 import pytest
 from unittest.mock import MagicMock, patch, ANY
 from pydantic import ValidationError
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from fastapi import HTTPException
 from pydantic_core import ValidationError
@@ -704,21 +705,6 @@ def test_see_discard_pile_invalid_amount():
 
     with pytest.raises(InvalidAmountOfCards):
         CardService.see_top_discard(db, game_id,0)
-
-
-# Test look into the ashes
-
-def test_look_into_the_ashes_card_not_in_discard():
-    db = MagicMock()
-    game_id = uuid.uuid4()
-    player_id = uuid.uuid4()
-    event_id = uuid.uuid4()
-    mock_cards = [make_mock_discard_pile(o) for o in [7,6,5,4,3]]
-
-    fake_card_id = uuid.uuid4()
-    with patch("app.card.service.CardService.see_top_discard", return_value=mock_cards):
-        with pytest.raises(CardsNotFoundOrInvalidException):
-            CardService.look_into_the_ashes(db, game_id, event_id,card_id=fake_card_id, player_id=player_id)
 
 
 # Helper

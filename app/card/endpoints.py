@@ -622,7 +622,7 @@ async def play_event(
         }
 
     broadcast_data = {
-        "name": event_card.name,
+        "name": event_card.description,
         "id_player": str(payload.player_id),
         "last_card": last_card_dict,
     }

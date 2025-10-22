@@ -14,3 +14,4 @@ class PlayerOutDTO:
     name: str
     birthday: date
     game_id: Optional[UUID] = None
+    social_disgrace: bool = False

@@ -18,10 +18,15 @@ def get_players(db=Depends(get_db)) -> list[PlayerOut]:
     """
     list_players = []
     for player in PlayerService(db).get_players():
-        list_players.append(PlayerOut(id=player.id, 
-                                      name=player.name, 
-                                      birthday=player.birthday,
-                                      game_id=player.game_id if hasattr(player, 'game_id') else None))
+        list_players.append(
+            PlayerOut(
+                id=player.id,
+                name=player.name,
+                birthday=player.birthday,
+                game_id=player.game_id if hasattr(player, 'game_id') else None,
+                social_disgrace=player.social_disgrace,
+            )
+        )
     return list_players
 
 @player_router.get("/{player_id}")
@@ -43,7 +48,8 @@ def get_player_by_id(player_id: UUID, db=Depends(get_db)) -> PlayerOut:
     return PlayerOut(id=player.id, 
                      name=player.name, 
                      birthday=player.birthday,
-                     game_id=player.game_id if hasattr(player, 'game_id') else None)
+                     game_id=player.game_id if hasattr(player, 'game_id') else None,
+                     social_disgrace=player.social_disgrace)
 
 @player_router.post("/", status_code=status.HTTP_201_CREATED)
 def create_player(player_data: PlayerIn, db=Depends(get_db)) -> PlayerResponse:
@@ -70,4 +76,3 @@ def create_player(player_data: PlayerIn, db=Depends(get_db)) -> PlayerResponse:
             detail=str(e)
             )
     return PlayerResponse(id=create_player.id)
-

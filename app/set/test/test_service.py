@@ -10,6 +10,9 @@ from app.set.enums import SetType
 from app.set.models import Set as SetModel
 from app.set.service import SetService
 from app.secret.enums import SecretType
+from app.secret.dtos import SecretOutDTO
+from app.secret.models import Secrets
+from app.game.schemas import EndGameResult, GameEndReason
 from types import SimpleNamespace
 
 
@@ -538,3 +541,241 @@ def test_play_set_normal_success_when_hidden(set_service, db_session):
     assert isinstance(result, SetPlayResult)
     assert result.set_out.id == fake_set.id
     assert result.end_game_result is None
+
+@pytest.fixture
+def base_data():
+    """Datos comunes para los tests de play_set"""
+    game_id = uuid.uuid4()
+    set_id = uuid.uuid4()
+    player_id = uuid.uuid4() # Jugador que juega el set
+    target_player_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+    return {
+        "game_id": game_id,
+        "set_id": set_id,
+        "player_id": player_id,
+        "target_player_id": target_player_id,
+        "secret_id": secret_id,
+    }
+
+# --- Test: Revelar Secreto Normal (Sin Fin de Juego) ---
+def test_play_set_reveal_common_secret_success(set_service, db_session, base_data):
+    mock_set = MagicMock(
+        spec=SetModel, 
+        id=base_data["set_id"],
+        type=SetType.MS,
+        game_id=base_data["game_id"],
+        owner_player_id=base_data["player_id"]
+    )
+    mock_secret = MagicMock(
+        spec=SecretOutDTO, 
+        id=base_data["secret_id"], 
+        owner_player_id=base_data["target_player_id"], 
+        revealed=False, 
+        role=SecretType.COMMON
+    )
+
+    mock_secret_after_reveal = MagicMock(spec=SecretOutDTO)
+    mock_secret_after_reveal.id = mock_secret.id
+    mock_secret_after_reveal.owner_player_id = mock_secret.owner_player_id
+    mock_secret_after_reveal.revealed = True
+    mock_secret_after_reveal.role = mock_secret.role
+
+    db_session.query.return_value.filter.return_value.first.return_value = mock_set
+    db_session.query.return_value.filter.return_value.scalar.return_value = 1
+
+    mock_secret_service_instance = MagicMock()
+    mock_secret_service_instance.get_secret_by_id.return_value = mock_secret
+    mock_secret_service_instance.change_secret_status.return_value = mock_secret_after_reveal
+
+    mock_game_service_instance = MagicMock()
+
+    with patch("app.set.service.SecretService", return_value=mock_secret_service_instance), \
+         patch("app.set.service.GameService", return_value=mock_game_service_instance):
+
+        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+
+    mock_secret_service_instance.get_secret_by_id.assert_called_once_with(db_session, base_data["secret_id"])
+    mock_secret_service_instance.change_secret_status.assert_called_once_with(db_session, base_data["secret_id"])
+    mock_game_service_instance.end_game.assert_not_called()
+    assert isinstance(result, SetPlayResult)
+    assert result.set_out.id == base_data["set_id"]
+    assert result.end_game_result is None
+
+# --- Test: Revelar Secreto de Asesino (Termina Juego) ---
+def test_play_set_reveal_murderer_secret_ends_game(set_service, db_session, base_data):
+    mock_set = MagicMock(
+        spec=SetModel, 
+        id=base_data["set_id"], 
+        type=SetType.MS, 
+        game_id=base_data["game_id"],
+        owner_player_id=base_data["player_id"]
+    )
+    mock_secret_murderer = MagicMock(
+        spec=SecretOutDTO, 
+        id=base_data["secret_id"], 
+        owner_player_id=base_data["target_player_id"], 
+        revealed=False, 
+        role=SecretType.MURDERER
+    )
+    mock_secret_after_reveal = MagicMock(spec=SecretOutDTO)
+    mock_secret_after_reveal.id = mock_secret_murderer.id
+    mock_secret_after_reveal.owner_player_id = mock_secret_murderer.owner_player_id
+    mock_secret_after_reveal.revealed = True
+    mock_secret_after_reveal.role = mock_secret_murderer.role
+    mock_end_game_dto = MagicMock(spec=EndGameResult)
+
+    db_session.query.return_value.filter.return_value.first.return_value = mock_set
+
+    mock_secret_service_instance = MagicMock()
+    mock_secret_service_instance.get_secret_by_id.return_value = mock_secret_murderer
+    mock_secret_service_instance.change_secret_status.return_value = mock_secret_after_reveal
+
+    mock_game_service_instance = MagicMock()
+    mock_game_service_instance.end_game.return_value = mock_end_game_dto 
+
+    with patch("app.set.service.SecretService", return_value=mock_secret_service_instance), \
+         patch("app.set.service.GameService", return_value=mock_game_service_instance):
+
+        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+
+    mock_secret_service_instance.change_secret_status.assert_called_once()
+    mock_game_service_instance.end_game.assert_called_once_with(base_data["game_id"], GameEndReason.MURDERER_REVEALED)
+    assert isinstance(result, SetPlayResult)
+    assert result.set_out.id == base_data["set_id"]
+    assert result.end_game_result == mock_end_game_dto 
+
+# --- Test: Revelar Último Secreto de Detective (Termina Juego) ---
+def test_play_set_reveal_last_detective_secret_ends_game(set_service, db_session, base_data):
+    mock_set = MagicMock(
+        spec=SetModel, 
+        id=base_data["set_id"], 
+        type=SetType.MS, 
+        game_id=base_data["game_id"],
+        owner_player_id=base_data["player_id"]
+    )
+    mock_secret_common = MagicMock(
+        spec=SecretOutDTO, 
+        id=base_data["secret_id"], 
+        owner_player_id=base_data["target_player_id"], 
+        revealed=False, 
+        role=SecretType.COMMON
+    )
+    mock_secret_after_reveal = MagicMock(spec=SecretOutDTO)
+    mock_secret_after_reveal.id = mock_secret_common.id
+    mock_secret_after_reveal.owner_player_id = mock_secret_common.owner_player_id
+    mock_secret_after_reveal.revealed = True 
+    mock_secret_after_reveal.role = mock_secret_common.role
+    mock_murderer_secret_hidden = MagicMock(spec=Secrets, revealed=False) 
+    mock_end_game_dto = MagicMock(spec=EndGameResult)
+
+    def query_filter_first_side_effect(*args, **kwargs):
+        if not hasattr(query_filter_first_side_effect, 'call_count'):
+            query_filter_first_side_effect.call_count = 1
+        count = query_filter_first_side_effect.call_count
+        query_filter_first_side_effect.call_count += 1
+        if count == 1: return mock_set
+        elif count == 2: return mock_murderer_secret_hidden
+        return MagicMock()
+    if hasattr(query_filter_first_side_effect, 'call_count'):
+         del query_filter_first_side_effect.call_count
+    db_session.query.return_value.filter.return_value.first.side_effect = query_filter_first_side_effect
+    db_session.query.return_value.filter.return_value.scalar.return_value = 0
+
+    mock_secret_service_instance = MagicMock()
+    mock_secret_service_instance.get_secret_by_id.return_value = mock_secret_common
+    mock_secret_service_instance.change_secret_status.return_value = mock_secret_after_reveal
+    murderer_id = uuid.uuid4()
+
+    mock_game_service_instance = MagicMock()
+    mock_game_service_instance.end_game.return_value = mock_end_game_dto
+
+    with patch("app.set.service.SecretService", return_value=mock_secret_service_instance), \
+         patch("app.set.service.GameService", return_value=mock_game_service_instance), \
+         patch("app.set.service.SecretService.get_murderer_team_ids", return_value={murderer_id}) as mock_static_get_ids:
+
+        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+
+    mock_secret_service_instance.change_secret_status.assert_called_once()
+    mock_static_get_ids.assert_called_once_with(db_session, base_data["game_id"])
+    assert db_session.query.return_value.filter.return_value.scalar.call_count == 1
+    assert db_session.query.return_value.filter.return_value.first.call_count == 2
+    mock_game_service_instance.end_game.assert_called_once_with(base_data["game_id"], GameEndReason.SECRETS_REVEALED)
+    assert isinstance(result, SetPlayResult)
+    assert result.end_game_result == mock_end_game_dto
+
+# --- Test: Usar Parker Pyne (PP) para Ocultar Secreto (Sin Fin de Juego) ---
+def test_play_set_pp_hide_secret_success(set_service, db_session, base_data):
+    mock_set_pp = MagicMock(
+        spec=SetModel, 
+        id=base_data["set_id"], 
+        type=SetType.PP, 
+        game_id=base_data["game_id"],
+        owner_player_id=base_data["player_id"]
+    )
+    mock_secret_revealed = MagicMock(
+        spec=SecretOutDTO, 
+        id=base_data["secret_id"], 
+        owner_player_id=base_data["target_player_id"], 
+        revealed=True, 
+        role=SecretType.COMMON)
+    mock_secret_after_hide = MagicMock(spec=SecretOutDTO)
+    mock_secret_after_hide.id = mock_secret_revealed.id
+    mock_secret_after_hide.owner_player_id = mock_secret_revealed.owner_player_id
+    mock_secret_after_hide.revealed = False
+    mock_secret_after_hide.role = mock_secret_revealed.role
+    db_session.query.return_value.filter.return_value.first.return_value = mock_set_pp
+
+    mock_secret_service_instance = MagicMock()
+    mock_secret_service_instance.get_secret_by_id.return_value = mock_secret_revealed
+    mock_secret_service_instance.change_secret_status.return_value = mock_secret_after_hide
+
+    mock_game_service_instance = MagicMock()
+
+    with patch("app.set.service.SecretService", return_value=mock_secret_service_instance), \
+         patch("app.set.service.GameService", return_value=mock_game_service_instance):
+
+        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+
+    mock_secret_service_instance.change_secret_status.assert_called_once()
+    mock_game_service_instance.end_game.assert_not_called()
+    assert isinstance(result, SetPlayResult)
+    assert result.set_out.id == mock_set_pp.id 
+    assert result.end_game_result is None
+
+# --- Tests de Errores de Validación ---
+def test_play_set_secret_not_found_raises(set_service, db_session, base_data):
+    mock_set = MagicMock(spec=SetModel, id=base_data["set_id"], type=SetType.MS)
+    db_session.query.return_value.filter.return_value.first.return_value = mock_set
+
+    mock_secret_service_instance = MagicMock()
+    mock_secret_service_instance.get_secret_by_id.return_value = None
+
+    with patch("app.set.service.SecretService", return_value=mock_secret_service_instance):
+        with pytest.raises(ValueError, match="Secret not found"):
+            set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+
+def test_play_set_secret_wrong_owner_raises(set_service, db_session, base_data):
+    mock_set = MagicMock(spec=SetModel, id=base_data["set_id"], type=SetType.MS)
+    wrong_owner_id = uuid.uuid4()
+    mock_secret = MagicMock(spec=SecretOutDTO, id=base_data["secret_id"], owner_player_id=wrong_owner_id)
+    db_session.query.return_value.filter.return_value.first.return_value = mock_set
+
+    mock_secret_service_instance = MagicMock()
+    mock_secret_service_instance.get_secret_by_id.return_value = mock_secret
+
+    with patch("app.set.service.SecretService", return_value=mock_secret_service_instance):
+        with pytest.raises(ValueError, match="The secret must belong to the target player"):
+            set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+
+def test_play_set_reveal_already_revealed_raises(set_service, db_session, base_data):
+    mock_set = MagicMock(spec=SetModel, id=base_data["set_id"], type=SetType.MS) 
+    mock_secret = MagicMock(spec=SecretOutDTO, id=base_data["secret_id"], owner_player_id=base_data["target_player_id"], revealed=True) 
+    db_session.query.return_value.filter.return_value.first.return_value = mock_set
+
+    mock_secret_service_instance = MagicMock()
+    mock_secret_service_instance.get_secret_by_id.return_value = mock_secret
+
+    with patch("app.set.service.SecretService", return_value=mock_secret_service_instance):
+        with pytest.raises(ValueError, match="The secret is already revealed"):
+            set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])

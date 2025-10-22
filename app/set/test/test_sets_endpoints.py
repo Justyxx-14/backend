@@ -10,6 +10,7 @@ from app.set import endpoints as endpoints_mod
 from app.set.dtos import SetOut, SetPlayResult
 from app.set.endpoints import sets_router
 from app.set.enums import SetType
+from app.game.schemas import EndGameResult
 from app.set import schemas
 
 
@@ -468,3 +469,105 @@ def test_election_secret_validation_fails_not_in_game(client, election_mocks):
     assert response.status_code == 400
     assert response.json() == {"detail": "BadRequest"}
     election_mocks.set_service.play_set.assert_not_called()
+
+
+# --- Test Endpoint play_set_detective (Caso Normal) ---
+def test_play_set_detective_hp_set_no_end(client, play_set_mocks):
+    play_set_mocks.set_service.determine_set_type.return_value = SetType.HP
+    play_set_mocks.payload["secret_id"] = str(uuid.uuid4())
+    
+    hp_set_out = make_set_out(uuid.uuid4(), play_set_mocks.gid, play_set_mocks.pid, SetType.HP)
+    play_set_mocks.set_service.create_set.return_value = hp_set_out
+    
+    fake_play_result = SetPlayResult(set_out=hp_set_out, end_game_result=None)
+    play_set_mocks.set_service.play_set.return_value = fake_play_result
+
+    response = client.post(f"/sets/play/{play_set_mocks.gid}", json=play_set_mocks.payload)
+    
+    assert response.status_code == 201
+    play_set_mocks.set_service.determine_set_type.assert_called_once()
+    play_set_mocks.set_service.create_set.assert_called_once()
+    play_set_mocks.set_service.play_set.assert_called_once()
+    
+    play_set_mocks.manager.broadcast_to_game.assert_awaited_once()
+    args, _ = play_set_mocks.manager.broadcast_to_game.call_args
+    assert args[0] == play_set_mocks.gid
+    assert args[1]["type"] == "playSet"
+    assert args[1]["data"]["set_type"] == "HP"
+    
+    data = response.json()
+    assert data["id"] == str(hp_set_out.id)
+
+# --- Test Endpoint play_set_detective (Termina Juego) ---
+def test_play_set_detective_hp_set_ends_game(client, play_set_mocks):
+    play_set_mocks.set_service.determine_set_type.return_value = SetType.HP
+    play_set_mocks.payload["secret_id"] = str(uuid.uuid4())
+    
+    hp_set_out = make_set_out(uuid.uuid4(), play_set_mocks.gid, play_set_mocks.pid, SetType.HP)
+    play_set_mocks.set_service.create_set.return_value = hp_set_out
+    
+    mock_end_result = MagicMock(spec=EndGameResult)
+    mock_end_result.model_dump.return_value = {"reason": "MURDERER_REVEALED", "winners": []} 
+    fake_play_result = SetPlayResult(set_out=hp_set_out, end_game_result=mock_end_result)
+    play_set_mocks.set_service.play_set.return_value = fake_play_result
+
+    response = client.post(f"/sets/play/{play_set_mocks.gid}", json=play_set_mocks.payload)
+    
+    assert response.status_code == 201
+    play_set_mocks.set_service.determine_set_type.assert_called_once()
+    play_set_mocks.set_service.create_set.assert_called_once()
+    play_set_mocks.set_service.play_set.assert_called_once()
+    
+    play_set_mocks.manager.broadcast_to_game.assert_awaited_once()
+    args, _ = play_set_mocks.manager.broadcast_to_game.call_args
+    assert args[0] == play_set_mocks.gid
+    assert args[1]["type"] == "gameEnd"
+    assert args[1]["data"]["reason"] == "MURDERER_REVEALED" 
+    
+    data = response.json()
+    assert data["id"] == str(hp_set_out.id)
+
+# --- Test Endpoint election_secret_set (Caso Normal) ---
+def test_election_secret_happy_path_no_end(client, election_mocks):
+
+    response = client.post(f"/sets/election_secret/{election_mocks.gid}", json=election_mocks.payload)
+    
+    assert response.status_code == 200
+    election_mocks.game_service.get_game_by_id.assert_called_once_with(election_mocks.gid)
+    election_mocks.set_service.play_set.assert_called_once_with(
+        election_mocks.sid, election_mocks.pid, election_mocks.sec_id
+    )
+    
+    election_mocks.manager.broadcast_to_game.assert_awaited_once()
+    args, _ = election_mocks.manager.broadcast_to_game.call_args
+    assert args[0] == election_mocks.gid
+    assert args[1]["type"] == "playSet"
+    assert args[1]["data"]["set_type"] == "MS" 
+    
+    data = response.json()
+    assert data["id"] == election_mocks.payload["set_id"]
+
+# --- Test Endpoint election_secret_set (Termina Juego) ---
+def test_election_secret_ends_game(client, election_mocks):
+    mock_set_out = election_mocks.set_service.play_set.return_value.set_out 
+    mock_end_result = MagicMock(spec=EndGameResult)
+    mock_end_result.model_dump.return_value = {"reason": "SECRETS_REVEALED", "winners": []} 
+    fake_play_result_with_end = SetPlayResult(set_out=mock_set_out, end_game_result=mock_end_result)
+    election_mocks.set_service.play_set.return_value = fake_play_result_with_end
+
+    response = client.post(f"/sets/election_secret/{election_mocks.gid}", json=election_mocks.payload)
+    
+    assert response.status_code == 200 
+    election_mocks.game_service.get_game_by_id.assert_called_once_with(election_mocks.gid)
+    election_mocks.set_service.play_set.assert_called_once_with(
+        election_mocks.sid, election_mocks.pid, election_mocks.sec_id
+    )
+    
+    election_mocks.manager.broadcast_to_game.assert_awaited_once()
+    args, _ = election_mocks.manager.broadcast_to_game.call_args
+    assert args[0] == election_mocks.gid
+    assert args[1]["type"] == "gameEnd" 
+    assert args[1]["data"]["reason"] == "SECRETS_REVEALED"
+    
+    data = response.json()
+    assert data["id"] == election_mocks.payload["set_id"]

@@ -22,11 +22,7 @@ async def root():
     return {"message": "Hello World"}
 
 
-origins = [
-    "http://localhost:5173", 
-    "*"
-]
-
+origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,

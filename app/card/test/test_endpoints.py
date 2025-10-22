@@ -4,16 +4,19 @@ import uuid
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock, AsyncMock, patch
 from app.card import schemas
 from app.card import enums
 from app.card import endpoints
+from app.card.models import Card
+from app.card.enums import CardOwner, CardType
 from app.main import app
 from app.db import get_db
 from app.card.exceptions import PlayerHandLimitExceededException
 from app.card.exceptions import CardsNotFoundOrInvalidException
 from app.card import endpoints
 from app.set.enums import SetType
+from app.game.schemas import EndGameResult, GameEndReason
 from fastapi.encoders import jsonable_encoder
 
 # -------------Helpers / Fake Data
@@ -874,7 +877,7 @@ def test_play_event_etp_ok(client, monkeypatch):
     assert args[0] == game_id
     evt = args[1]
     assert evt["type"] == "playEvent"
-    assert evt["data"]["name"] == "E_ETP"
+    assert evt["data"]["name"] == "Early Train to Paddington"
     assert evt["data"]["id_player"] == str(player_id)
 
 
@@ -1054,7 +1057,7 @@ def test_play_event_cot_ok(client, monkeypatch):
     assert args[0] == game_id
     evt = args[1]
     assert evt["type"] == "playEvent"
-    assert evt["data"]["name"] == "E_COT"
+    assert evt["data"]["name"] == "Cards off the table"
     assert evt["data"]["id_player"] == str(player_id)
     assert evt["data"]["target_player"] == str(target_player)
     assert evt["data"]["last_card"]["name"] == "Fake Top Card"
@@ -1225,7 +1228,7 @@ def test_play_event_atwom_ok(client, monkeypatch,fake_cards_fixture):
     assert args[0] == game_id
     evt = args[1]
     assert evt["type"] == "playEvent"
-    assert evt["data"]["name"] == "E_ATWOM"
+    assert evt["data"]["name"] == "And Then There Was One More"
     assert evt["data"]["id_player"] == str(player_id)
     assert evt["data"]["target_player"] == str(target_player)
     assert evt["data"]["secret_data"] == fake_secret
@@ -1314,7 +1317,6 @@ def fake_cards_fixture_AV():
     }
 
 # --- Tests E_AV ---
-
 
 def test_play_event_av_ok(client, monkeypatch, fake_cards_fixture_AV):
     """
@@ -1441,3 +1443,68 @@ def test_play_event_av_invalid_game_or_player(client, monkeypatch, fake_cards_fi
     res = client.put(f"/cards/play/E_AV/{game_id}", json=payload)
     assert res.status_code == 400
     assert res.json()["detail"] == "GameNotFoundOrPlayerNotInGame"
+
+
+# --- Test draw_cards ---
+def test_draw_cards_deck_becomes_empty_sends_game_end(client, monkeypatch):
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    card_id = uuid.uuid4()
+
+    mock_card_object = MagicMock(spec=Card) 
+    mock_card_object.id = card_id
+    mock_card_object.game_id = game_id 
+    mock_card_object.type = CardType.EVENT 
+    mock_card_object.name = "Test Card" 
+    mock_card_object.description = "Test Desc" 
+    mock_card_object.owner = CardOwner.PLAYER
+    mock_card_object.owner_player_id = player_id
+    
+    mock_cards_list = [mock_card_object]
+
+    fake_game = MagicMock(players_ids=[player_id])
+    mock_game_service_instance = MagicMock()
+    mock_game_service_instance.get_game_by_id.return_value = fake_game
+    mock_game_service_instance.get_turn.return_value = player_id
+    mock_end_result = MagicMock(spec=EndGameResult)
+    mock_end_result.model_dump.return_value = {"reason": "DECK_EMPTY", "winners": []}
+    mock_game_service_instance.end_game.return_value = mock_end_result
+    
+    mock_card_service_instance = MagicMock()
+    mock_card_service_instance.moveDeckToPlayer.return_value = (mock_cards_list, True) 
+
+    mock_broadcast = AsyncMock()
+
+    with patch("app.card.endpoints.GameService", return_value=mock_game_service_instance), \
+         patch("app.card.endpoints.CardService", mock_card_service_instance), \
+         patch("app.card.endpoints.manager.broadcast_to_game", mock_broadcast):
+        
+        response = client.put(f"/cards/draw/{game_id}", json={
+            "player_id": str(player_id),
+            "n_cards": 1
+        })
+
+    assert response.status_code == 200
+    response_data = response.json()
+    assert isinstance(response_data, list)
+    assert len(response_data) == 1
+    assert response_data[0]['id'] == str(mock_card_object.id) 
+    assert response_data[0]['name'] == mock_card_object.name
+    assert response_data[0]['owner'] == mock_card_object.owner.value
+    
+    mock_card_service_instance.moveDeckToPlayer.assert_called_once()
+    mock_game_service_instance.end_game.assert_called_once_with(game_id, GameEndReason.DECK_EMPTY)
+    
+    assert mock_broadcast.await_count == 2 
+
+    call_list = mock_broadcast.await_args_list 
+
+    args1, kwargs1 = call_list[0]
+    assert args1[0] == game_id   
+    assert args1[1]["type"] == "gameEnd" 
+    assert args1[1]["data"]["reason"] == "DECK_EMPTY"
+
+    args2, kwargs2 = call_list[1]
+    assert args2[0] == game_id
+    assert args2[1]["type"] == "playerDrawCards" 
+    assert args2[1]["data"]["id_player"] == str(player_id)

@@ -55,10 +55,11 @@ def test_playerin_missing_fields_raise():
 def test_playerout_valid_uuid_objects_and_to_dto():
     id_ = uuid4()
     game_id = uuid4()
-    p = PlayerOut(id=id_, name="Jugador", birthday=date(1990, 2, 3), game_id=game_id)
+    p = PlayerOut(id=id_, name="Jugador", birthday=date(1990, 2, 3), game_id=game_id, social_disgrace=True)
 
     assert isinstance(p.id, UUID)
     assert isinstance(p.game_id, UUID)
+    assert p.social_disgrace is True
 
     dto = p.to_dto()
     assert isinstance(dto, PlayerOutDTO)
@@ -66,6 +67,7 @@ def test_playerout_valid_uuid_objects_and_to_dto():
     assert dto.name == p.name
     assert dto.birthday == p.birthday
     assert dto.game_id == p.game_id
+    assert dto.social_disgrace is True
 
 
 def test_playerout_accepts_uuid_strings_and_parses_them():
@@ -78,10 +80,12 @@ def test_playerout_accepts_uuid_strings_and_parses_them():
 
     assert isinstance(p.game_id, UUID)
     assert str(p.game_id) == game_id_str
+    assert p.social_disgrace is False
 
     dto = p.to_dto()
     assert dto.id == p.id
     assert dto.game_id == p.game_id
+    assert dto.social_disgrace is False
 
 
 def test_playerout_invalid_uuid_raises():
@@ -99,7 +103,6 @@ def test_playerout_name_length_limits():
     name_41 = "a" * 41
     with pytest.raises(ValidationError):
         PlayerOut(id=uuid4(), name=name_41, birthday=date(1995, 6, 7))
-
 
 
 

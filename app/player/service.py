@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.player.dtos import PlayerInDTO, PlayerOutDTO
 from app.player.models import Player
+from app.secret.models import Secrets
+from app.secret.enums import SecretType
 
 class PlayerService:
     def __init__(self, db: Session):
@@ -21,7 +23,8 @@ class PlayerService:
                 id=player.id,
                 name=player.name,
                 birthday=player.birthday,
-                game_id=None # player.game_id if player.game_id else None -> Aún no implementado en el modelo
+                game_id=player.game_id,
+                social_disgrace=player.social_disgrace
             )
             for player in players
         ]   
@@ -37,7 +40,8 @@ class PlayerService:
             id=player.id,
             name=player.name,
             birthday=player.birthday,
-            game_id= None # player.game_id if player.game_id else None -> Aún no implementado en el modelo
+            game_id=player.game_id,
+            social_disgrace=player.social_disgrace
         )
     
     def get_player_entity_by_id(self, player_id: UUID) -> Optional[Player]:
@@ -66,7 +70,8 @@ class PlayerService:
             id=new_player.id,
             name=new_player.name,
             birthday=new_player.birthday,
-            game_id = None
+            game_id=new_player.game_id,
+            social_disgrace=new_player.social_disgrace
         )
     
     def assign_game_to_player(self, player_id: UUID, game_id: UUID) -> PlayerOutDTO:
@@ -85,7 +90,8 @@ class PlayerService:
             id=player.id,
             name=player.name,
             birthday=player.birthday,
-            game_id=game_id
+            game_id=game_id,
+            social_disgrace=player.social_disgrace
         )
     
     def delete_player(self, player_id: UUID) -> UUID:
@@ -100,3 +106,30 @@ class PlayerService:
             self.db.rollback()
             raise e
         return player_id
+
+    @staticmethod
+    def update_social_disgrace(db: Session, player_id: UUID | None) -> None:
+        """
+        Recalcula el estado de desgracia social para un jugador.
+        Si todos los secretos de un jugador están todos revelados
+        o el jugador no tiene secretos, entonces cae entra en
+        desgracia social.
+        """
+        if player_id is None:
+            return
+
+        player = db.query(Player).filter(Player.id == player_id).first()
+        if not player:
+            return
+
+        secrets = (
+            db.query(Secrets)
+            .filter(Secrets.owner_player_id == player_id)
+            .all()
+        )
+
+        if not secrets:
+            player.social_disgrace = True
+            return
+
+        player.social_disgrace = all(secret.revealed for secret in secrets)

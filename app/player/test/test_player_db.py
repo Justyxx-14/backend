@@ -1,4 +1,3 @@
-# tests/test_player.py
 import uuid
 from datetime import date, timedelta
 
@@ -39,6 +38,7 @@ def test_create_valid_player_persists_and_generates_uuid(session):
     assert saved.name == "test_name"
     assert saved.birthday == date(2000, 1, 1)
     assert isinstance(saved.id, uuid.UUID)
+    assert saved.social_disgrace is False
 
 
 def test_default_uuid_is_generated_if_not_provided(session):
@@ -46,6 +46,7 @@ def test_default_uuid_is_generated_if_not_provided(session):
     session.add(p)
     session.commit()
     assert isinstance(p.id, uuid.UUID)
+    assert p.social_disgrace is False
 
 
 def test_whitespace_only_name_raises_value_error_on_construction():

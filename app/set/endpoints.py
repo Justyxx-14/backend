@@ -233,6 +233,3 @@ async def election_secret_set(
         type=set_out.type, 
         owner_player_id=set_out.owner_player_id
     )
-
-
-

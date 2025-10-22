@@ -1,6 +1,6 @@
 import uuid
 from datetime import date
-from sqlalchemy import Column, String, Date, UUID, ForeignKey
+from sqlalchemy import Column, String, Date, UUID, ForeignKey, Boolean
 from sqlalchemy.orm import validates, relationship, Mapped, mapped_column
 
 from app.db import Base
@@ -13,6 +13,7 @@ class Player(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     birthday: Mapped[date] = mapped_column(Date, nullable=False)
     game_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("games.id", use_alter=True), nullable=True)
+    social_disgrace: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     game = relationship(
         "Game", 

@@ -18,13 +18,15 @@ class PlayerOut(BaseModel):
     name: str = Field(..., min_length=1, max_length=40)
     birthday: date = Field(...)
     game_id: UUID | None = Field(None)
+    social_disgrace: bool = Field(False)
 
     def to_dto(self) -> PlayerOutDTO:
         return PlayerOutDTO(
             id=self.id,
             name=self.name,
             birthday=self.birthday,
-            game_id=self.game_id
+            game_id=self.game_id,
+            social_disgrace=self.social_disgrace
         )
     
 class PlayerResponse(BaseModel):

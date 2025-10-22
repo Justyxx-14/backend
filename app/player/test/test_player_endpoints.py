@@ -1,13 +1,14 @@
-import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from fastapi import status
-from unittest.mock import MagicMock
-import uuid
 import datetime
+import uuid
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi import FastAPI, status
+from fastapi.testclient import TestClient
 
 from app.player.endpoints import player_router
-from app.player.schemas import PlayerIn, PlayerOut, PlayerResponse
+from app.player.schemas import PlayerOut
+
 
 app = FastAPI()
 app.include_router(player_router)
@@ -18,7 +19,8 @@ def sample_player():
     return PlayerOut(
         id=uuid.uuid4(),
         name="test_player",
-        birthday=datetime.date(1990, 1, 1)
+        birthday=datetime.date(1990, 1, 1),
+        social_disgrace=False,
     )
     
 
@@ -45,6 +47,7 @@ def test_get_players_non_empty(monkeypatch, sample_player):
     assert data[0]["id"] == str(sample_player.id)
     assert data[0]["name"] == sample_player.name
     assert data[0]["birthday"] == sample_player.birthday.isoformat()
+    assert data[0]["social_disgrace"] is sample_player.social_disgrace
 
 def test_get_player_by_id_found(monkeypatch, sample_player):
     mock_service = MagicMock()
@@ -58,6 +61,7 @@ def test_get_player_by_id_found(monkeypatch, sample_player):
     assert data["id"] == str(sample_player.id)
     assert data["name"] == sample_player.name
     assert data["birthday"] == sample_player.birthday.isoformat()
+    assert data["social_disgrace"] is sample_player.social_disgrace
 
 def test_get_player_by_id_not_found(monkeypatch):
     mock_service = MagicMock()
@@ -108,4 +112,3 @@ def test_create_player_missing_field(monkeypatch):
     response = client.post("/players/", json=player_data)
 
     assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
-

@@ -8,6 +8,7 @@ from . import models
 from pathlib import Path
 from .enums import SecretType
 from .dtos import SecretInDTO, SecretOutDTO
+from app.player.service import PlayerService
 
 
 class SecretService:
@@ -176,6 +177,8 @@ class SecretService:
             raise ValueError(f"Secret with id {secret_id} not found")
         
         secret.revealed = not secret.revealed
+        db.flush()
+        PlayerService.update_social_disgrace(db, secret.owner_player_id)
         db.commit()
         db.refresh(secret)
         
@@ -189,7 +192,11 @@ class SecretService:
         if not secret:
             raise ValueError(f"Secret with id {secret_id} not found")
         
+        previous_owner = secret.owner_player_id
         secret.owner_player_id = new_player_id
+        db.flush()
+        PlayerService.update_social_disgrace(db, previous_owner)
+        PlayerService.update_social_disgrace(db, new_player_id)
         db.commit()
         db.refresh(secret)
 

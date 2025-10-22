@@ -636,24 +636,4 @@ class CardService:
         another_victim_out = CardService.move_card(db,event_card_id,move_in)
 
         return another_victim_out
-
-
-
-        
-
-        
-
-
-
-        
-
-
-
-
-
-
-
-        
-
-
     
