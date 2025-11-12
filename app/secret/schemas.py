@@ -7,7 +7,7 @@ from app.secret.enums import SecretType
 class SecretOut(BaseModel):
     id: UUID
     game_id: UUID
-    type: SecretType
+    role: SecretType
     name: str
     description: str
     owner_player_id: UUID | None  # por si el secreto no está asignado todavía
@@ -38,3 +38,11 @@ class SecretQuery(BaseModel):
 class SecretReveal(BaseModel):
     game_id: UUID
     secret_id: UUID
+
+class RevealSecretIn(BaseModel):
+    """
+    Payload para cuando un jugador revela un secreto
+    (usado por Point Your Suspicions).
+    """
+    player_id: UUID # El jugador que está revelando
+    secret_id: UUID # El secreto que revela

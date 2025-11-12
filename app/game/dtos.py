@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 class GameInDTO(BaseModel):
     name: str
+    password: str | None = None
     host_name: str
     birthday: date 
     min_players: int = Field(..., ge=2, le=6)
@@ -14,6 +15,7 @@ class GameInDTO(BaseModel):
 class GameOutDTO(BaseModel):
     id: UUID
     name: str 
+    password: str | None = None
     host_id: UUID
     min_players: int = Field(..., ge=2, le=6)
     max_players: int = Field(..., ge=2, le=6)

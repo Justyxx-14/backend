@@ -11,11 +11,11 @@ class SetPlayIn(BaseModel):
     target_player_id: UUID
 
 class SetElectionPlayer(BaseModel):
-    set_id: UUID
+    set_id: Optional[UUID | None] = None #para que sea compatible con el flujo de detective ariadne
     player_id: UUID
     secret_id: UUID
 
 class SetOut(BaseModel):
-    id: UUID
-    type: SetType
+    id: Optional[UUID | None] = None #para que sea compatible con el flujo de detective ariadne
+    type: Optional[SetType | None] = None
     owner_player_id: UUID

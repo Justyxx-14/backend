@@ -1,11 +1,14 @@
 import json
 import types
 import uuid
+
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch, ANY
 from app.card import schemas
+from app.secret.schemas import SecretOut
+from app.secret.enums import SecretType
 from app.card import enums
 from app.card import endpoints
 from app.card.models import Card
@@ -16,8 +19,11 @@ from app.card.exceptions import PlayerHandLimitExceededException
 from app.card.exceptions import CardsNotFoundOrInvalidException
 from app.card import endpoints
 from app.set.enums import SetType
-from app.game.schemas import EndGameResult, GameEndReason
+from app.game.schemas import EndGameResult, GameEndReason, GameTurnStateOut
+from app.game.enums import TurnState
+from app.game.models import Game, GameTurnState
 from fastapi.encoders import jsonable_encoder
+from app.secret.enums import SecretType
 
 # -------------Helpers / Fake Data
 
@@ -114,6 +120,8 @@ def client(monkeypatch):
     
     def see_top_discard(db, game_id, n):
         return []
+    def ensure_move_valid(db, game_id, player_id):
+        return False
 
     fake_service = types.SimpleNamespace(
         create_cards_batch=create_cards_batch,
@@ -122,7 +130,8 @@ def client(monkeypatch):
         move_card=move_card,
         moveDeckToPlayer=moveDeckToPlayer,
         movePlayertoDiscard=movePlayertoDiscard,
-        see_top_discard=see_top_discard
+        see_top_discard=see_top_discard,
+        ensure_move_valid=ensure_move_valid
     )
 
     from app.card import endpoints
@@ -315,6 +324,12 @@ def test_draw_cards_ok(client, monkeypatch):
         "get_turn", 
         lambda db, game_id: player_id
     )
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
+    monkeypatch.setattr(
+        endpoints.GameService,
+        "get_turn_state",
+        lambda db, game_id: fake_game_turn_state
+    )
 
     card_service_calls = {}
     def fake_move_deck_to_player(db, gid, pid, n):
@@ -390,6 +405,12 @@ def test_draw_cards_hand_limit_exceeded(client, monkeypatch):
         "get_turn", 
         lambda db, game_id: player_id
     )
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
+    monkeypatch.setattr(
+        endpoints.GameService,
+        "get_turn_state",
+        lambda db, game_id: fake_game_turn_state
+    )
 
     def fake_move_deck_to_player(db, gid, pid, n):
         raise PlayerHandLimitExceededException(detail="Hand limit exceeded")
@@ -404,6 +425,37 @@ def test_draw_cards_hand_limit_exceeded(client, monkeypatch):
     body = r.json()
     assert body["detail"] == "Hand limit exceeded"
 
+def test_draw_cards_invalid_turn_state(client, monkeypatch):
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+
+    fake_game = MagicMock()
+    fake_game.players_ids = [player_id]
+    monkeypatch.setattr(
+        endpoints.GameService, 
+        "get_game_by_id", 
+        lambda db, game_id: fake_game
+    )
+    monkeypatch.setattr(
+        endpoints.GameService, 
+        "get_turn", 
+        lambda db, game_id: player_id
+    )
+    fake_game_turn_state = MagicMock(turn_state = TurnState.END_TURN)
+    monkeypatch.setattr(
+        endpoints.GameService,
+        "get_turn_state",
+        lambda db, game_id: fake_game_turn_state
+    )
+    r = client.put(f"/cards/draw/{game_id}", json={
+    "player_id": str(player_id),
+    "n_cards": 1
+    })
+
+    assert r.status_code == 400
+    body = r.json()
+    assert body["detail"] == "Invalid accion for the game state"
+
 
 def test_pick_draft_card_broadcasts_serializable_payload(client, monkeypatch):
     game_id = uuid.uuid4()
@@ -411,6 +463,7 @@ def test_pick_draft_card_broadcasts_serializable_payload(client, monkeypatch):
     card_id = uuid.uuid4()
 
     fake_game = types.SimpleNamespace(id=game_id, players_ids=[player_id])
+    fake_game_turn_state = types.SimpleNamespace(turn_state = TurnState.IDLE)
 
     class FakeGameService:
         def __init__(self, db):
@@ -425,6 +478,9 @@ def test_pick_draft_card_broadcasts_serializable_payload(client, monkeypatch):
         def get_turn(self, game_id_param):
             assert game_id_param == self.expected_game_id
             return player_id
+        
+        def get_turn_state(self,game_id):
+            return fake_game_turn_state
 
     picked_card = types.SimpleNamespace(
         id=card_id,
@@ -460,8 +516,20 @@ def test_pick_draft_card_broadcasts_serializable_payload(client, monkeypatch):
         query_draft=fake_query_draft,
     )
 
+    fake_player = types.SimpleNamespace(social_disgrace= False)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+
+
     monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
     monkeypatch.setattr("app.card.endpoints.CardService", fake_card_service)
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
 
     mock_broadcast = AsyncMock()
     monkeypatch.setattr(endpoints.manager, "broadcast_to_game", mock_broadcast)
@@ -509,6 +577,14 @@ def test_discard_cards_ok(client, monkeypatch):
         "get_turn", 
         lambda db, game_id: player_id
     )
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
+    monkeypatch.setattr(
+        endpoints.GameService,
+        "get_turn_state",
+        lambda db, game_id: fake_game_turn_state
+    )
+    monkeypatch.setattr(endpoints.CardService, "ensure_move_valid",
+                        lambda db, gid, pid, n: True)
 
     calls = {}
     def fake_move_player_to_discard(db, gid, pid, ids):
@@ -585,6 +661,14 @@ def test_discard_cards_invalid(client, monkeypatch):
         "get_turn", 
         lambda db, game_id: player_id
     )
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
+    monkeypatch.setattr(
+        endpoints.GameService,
+        "get_turn_state",
+        lambda db, game_id: fake_game_turn_state
+    )
+    monkeypatch.setattr(endpoints.CardService, "ensure_move_valid",
+                        lambda db, gid, pid, n: True)
     
     def fake_move_player_to_discard(db, gid, pid, ids):
         raise CardsNotFoundOrInvalidException(detail="Invalid cards")
@@ -598,6 +682,40 @@ def test_discard_cards_invalid(client, monkeypatch):
     body = r.json()
     assert body["detail"] == "Invalid cards"
 
+def test_discard_cards_social_disgrace(client, monkeypatch):
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    card_ids = [uuid.uuid4()]
+    from app.card import endpoints
+
+    fake_game = MagicMock()
+    fake_game.players_ids = [player_id]
+    monkeypatch.setattr(
+        endpoints.GameService, 
+        "get_game_by_id", 
+        lambda db, game_id: fake_game
+    )
+    monkeypatch.setattr(
+        endpoints.GameService, 
+        "get_turn", 
+        lambda db, game_id: player_id
+    )
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
+    monkeypatch.setattr(
+        endpoints.GameService,
+        "get_turn_state",
+        lambda db, game_id: fake_game_turn_state
+    )
+    monkeypatch.setattr(endpoints.CardService, "ensure_move_valid",
+                        lambda db, gid, pid,n: False)
+    
+    r = client.put(f"/cards/discard/{game_id}", json={
+        "player_id": str(player_id),
+        "id_cards": [str(cid) for cid in card_ids],
+    })
+    assert r.status_code == 403
+    body = r.json()
+    assert body["detail"] == "El jugador esta en desgracia social, movimiento invalido"
 
 
 # --- TESTS DE WS EXCLUSIVOS ---
@@ -609,6 +727,60 @@ def _get(d, *keys):
         if k in d:
             return d[k]
     return None
+
+
+def _install_card_trade_services(monkeypatch, *, game_id, player_id, players_ids, player_entities, turn_state=TurnState.IDLE):
+    """
+    Parcha GameService y PlayerService para los tests de Card Trade.
+    Devuelve la lista mutable de llamados a change_turn_state.
+    """
+    change_calls: list[tuple[uuid.UUID, TurnState, dict]] = []
+
+    class FakeGameService:
+        def __init__(self, db):
+            pass
+
+        def get_game_by_id(self, gid=None, game_id=None):
+            return types.SimpleNamespace(id=game_id or gid, players_ids=players_ids)
+
+        def get_turn(self, gid=None, game_id=None):
+            return player_id
+
+        def get_turn_state(self, gid=None, game_id=None):
+            return types.SimpleNamespace(turn_state=turn_state)
+
+        def change_turn_state(self, gid, new_state, target_player_id=None, **kwargs):
+            change_calls.append((gid, new_state, {"target_player_id": target_player_id, **kwargs}))
+
+    class FakePlayerService:
+        def __init__(self, db):
+            pass
+
+        def get_player_entity_by_id(self, pid=None):
+            return player_entities.get(pid)
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
+
+    return change_calls
+
+
+def _make_player(player_id, *, social_disgrace=False):
+    """Helper para crear mocks de jugadores."""
+    return types.SimpleNamespace(id=player_id, social_disgrace=social_disgrace)
+
+
+def _make_last_card(game_id):
+    """Helper para simular la última carta del descarte."""
+    return types.SimpleNamespace(
+        id=uuid.uuid4(),
+        game_id=game_id,
+        type=CardType.EVENT,
+        name="Top Card",
+        description="Top description",
+        owner=CardOwner.DISCARD_PILE,
+        owner_player_id=None,
+    )
 
 def test_ws_emits_on_create_batch(client):
     """
@@ -722,10 +894,13 @@ def test_play_event_lia_ok(client, monkeypatch):
     card_id = uuid.uuid4()
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
     )
 
     moved_card = type(
@@ -751,6 +926,18 @@ def test_play_event_lia_ok(client, monkeypatch):
     fake_last_card.owner.value = "DISCARD_PILE"
     fake_last_card.owner_player_id = None
 
+    fake_player = types.SimpleNamespace(social_disgrace= False)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
+
     monkeypatch.setattr(
         "app.card.endpoints.CardService",
         type(
@@ -761,6 +948,7 @@ def test_play_event_lia_ok(client, monkeypatch):
                     lambda db, gid, eid, cid, pid: moved_card
                 ),
                 "see_top_discard": staticmethod(lambda db, gid, n: [fake_last_card]),
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
             },
         ),
     )
@@ -815,10 +1003,13 @@ def test_play_event_etp_ok(client, monkeypatch):
     card_id = uuid.uuid4()
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
     )
 
     fake_last_card = MagicMock()
@@ -843,6 +1034,17 @@ def test_play_event_etp_ok(client, monkeypatch):
             "owner_player_id": player_id,
         },
     )()
+    fake_player = types.SimpleNamespace(social_disgrace= False)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
 
     monkeypatch.setattr(
         "app.card.endpoints.CardService",
@@ -854,6 +1056,7 @@ def test_play_event_etp_ok(client, monkeypatch):
                     lambda db, gid, eid, pid: moved_card
                 ),
                 "see_top_discard": staticmethod(lambda db, gid, n: [fake_last_card]),
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
             },
         ),
     )
@@ -906,12 +1109,25 @@ def test_play_event_dme_ok(client, monkeypatch):
     event_id = uuid.uuid4()
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
     )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
 
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
 
     moved_card = type(
         "Card",
@@ -937,6 +1153,7 @@ def test_play_event_dme_ok(client, monkeypatch):
                     lambda db, gid, pid, eid: moved_card
                 ),
                 "see_top_discard": staticmethod(lambda db, gid, n: []),
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
             },
         ),
     )
@@ -991,12 +1208,25 @@ def test_play_event_cot_ok(client, monkeypatch):
     event_id = uuid.uuid4()
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id, target_player]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
     )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
 
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
     moved_card = type(
         "Card",
         (),
@@ -1030,6 +1260,7 @@ def test_play_event_cot_ok(client, monkeypatch):
                     lambda db, gid, pid, eid, target: moved_card
                 ),
                 "see_top_discard": staticmethod(lambda db, gid, n: [fake_last_card]),
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
             },
         ),
     )
@@ -1069,10 +1300,35 @@ def test_play_event_cot_missing_target_player(client, monkeypatch):
     player_id = uuid.uuid4()
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
+    )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
+
+    monkeypatch.setattr(
+        "app.card.endpoints.CardService",
+        type(
+            "FakeCardService",
+            (),
+            {
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
+            },
+        ),
     )
 
     payload = {
@@ -1092,10 +1348,35 @@ def test_play_event_cot_target_not_in_game(client, monkeypatch):
     target_player = uuid.uuid4()
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
+    )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
+
+    monkeypatch.setattr(
+        "app.card.endpoints.CardService",
+        type(
+            "FakeCardService",
+            (),
+            {
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
+            },
+        ),
     )
 
     payload = {
@@ -1173,12 +1454,25 @@ def test_play_event_atwom_ok(client, monkeypatch,fake_cards_fixture):
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id, target_player]})()
 
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
     )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
 
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
     fake_secret = {"id": str(secret_id), "content": "Secret info"}
 
     monkeypatch.setattr(
@@ -1191,6 +1485,7 @@ def test_play_event_atwom_ok(client, monkeypatch,fake_cards_fixture):
                     lambda db, gid, pid, eid, tid, sid: moved_card
                 ),
                 "see_top_discard": staticmethod(lambda db, gid, n: [fake_last_card]),
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
             },
         ),
     )
@@ -1244,10 +1539,35 @@ def test_play_event_atwom_target_not_in_game(client, monkeypatch,fake_cards_fixt
     secret_id = uuid.uuid4()
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
+    )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
+
+    monkeypatch.setattr(
+        "app.card.endpoints.CardService",
+        type(
+            "FakeCardService",
+            (),
+            {
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
+            },
+        ),
     )
 
     payload = {
@@ -1334,11 +1654,25 @@ def test_play_event_av_ok(client, monkeypatch, fake_cards_fixture_AV):
     fake_set = fake_cards_fixture_AV["fake_set"]
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
     )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
 
     class FakeCardService:
         @staticmethod
@@ -1348,8 +1682,13 @@ def test_play_event_av_ok(client, monkeypatch, fake_cards_fixture_AV):
         @staticmethod
         def see_top_discard(db, gid, n):
             return [fake_last_card]
+        
+        @staticmethod
+        def verify_cancellable_card(db, cid):
+            return False
 
     monkeypatch.setattr("app.card.endpoints.CardService", FakeCardService)
+    fake_respons_play_set = MagicMock(end_game_result = None)
 
     class FakeSetService:
         def __init__(self, db):
@@ -1361,7 +1700,7 @@ def test_play_event_av_ok(client, monkeypatch, fake_cards_fixture_AV):
 
         @staticmethod
         def play_set(*args, **kwargs):
-            return None
+            return fake_respons_play_set
 
     monkeypatch.setattr("app.card.endpoints.SetService", FakeSetService)
 
@@ -1382,13 +1721,12 @@ def test_play_event_av_ok(client, monkeypatch, fake_cards_fixture_AV):
     res = client.put(f"/cards/play/E_AV/{game_id}", json=payload)
 
     # --- Verificaciones ---
-    print(res.status_code, res.json())
     assert res.status_code == 200
     data = res.json()
     assert data["id"] == str(event_id)
     assert data["name"] == "E_AV"
 
-    fake_manager.broadcast_to_game.assert_awaited_once()
+    assert fake_manager.broadcast_to_game.await_count == 2
     args, _ = fake_manager.broadcast_to_game.call_args
     evt = args[1]
     assert evt["type"] == "playEvent"
@@ -1403,12 +1741,36 @@ def test_play_event_av_requires_set_and_target(client, monkeypatch, fake_cards_f
     event_id = fake_cards_fixture_AV["event_id"]
 
     fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
     monkeypatch.setattr(
         "app.card.endpoints.GameService",
         lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
-                                  "get_turn": lambda self, game_id: player_id})()
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
     )
+    fake_player = types.SimpleNamespace(social_disgrace= False)
 
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
+
+    monkeypatch.setattr(
+        "app.card.endpoints.CardService",
+        type(
+            "FakeCardService",
+            (),
+            {
+                "verify_cancellable_card": staticmethod(lambda db, cid: False),
+            },
+        ),
+    )
     # Falta set_id y target_player
     payload = {
         "player_id": str(player_id),
@@ -1444,6 +1806,516 @@ def test_play_event_av_invalid_game_or_player(client, monkeypatch, fake_cards_fi
     assert res.status_code == 400
     assert res.json()["detail"] == "GameNotFoundOrPlayerNotInGame"
 
+def test_play_evento_with_social_disgrace(client,monkeypatch,fake_cards_fixture_AV):
+    """Debe devolver 403 si el jugador esta en desgracia social"""
+    game_id = fake_cards_fixture_AV["game_id"]
+    player_id = fake_cards_fixture_AV["player_id"]
+
+    fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.IDLE)
+    monkeypatch.setattr(
+        "app.card.endpoints.GameService",
+        lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state})()
+    )
+    fake_player = types.SimpleNamespace(social_disgrace= True)
+
+    class FakePlayerService:
+        def __init__(self, db):
+            self.db = db
+            self.expected_game_id = game_id
+
+        def get_player_entity_by_id(self, player_id=None):
+            return fake_player
+        
+        
+    monkeypatch.setattr("app.card.endpoints.PlayerService", FakePlayerService)
+    payload = {
+        "player_id": str(player_id),
+        "event_id": str(uuid.uuid4())
+    }
+    res = client.put(f"/cards/play/E_AV/{game_id}", json=payload)
+    assert res.status_code == 403
+    assert res.json()["detail"] == "No se puede jugar un evento estando en Desgracia social"
+
+# --- Tests E_CT ---
+
+@pytest.mark.parametrize("input_code", ["d_fake", None])
+def test_play_event_ct_success(client, monkeypatch, input_code):
+    """Flujo exitoso con y sin requested_card_code en el payload."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    target_player = uuid.uuid4()
+    event_id = uuid.uuid4()
+    offered_card_id = uuid.uuid4()
+
+    change_calls = _install_card_trade_services(
+        monkeypatch,
+        game_id=game_id,
+        player_id=player_id,
+        players_ids=[player_id, target_player],
+        player_entities={
+            player_id: _make_player(player_id),
+            target_player: _make_player(target_player),
+        },
+    )
+
+    fake_event_card = types.SimpleNamespace(
+        id=event_id,
+        game_id=game_id,
+        name="E_CT",
+        description="Card Trade",
+        type=CardType.EVENT,
+        owner=CardOwner.PLAYER,
+        owner_player_id=player_id,
+    )
+    fake_offered_card = types.SimpleNamespace(
+        id=offered_card_id,
+        game_id=game_id,
+        name="DUMMY",
+        description="Offered",
+        type=CardType.DETECTIVE,
+        owner=CardOwner.PLAYER,
+        owner_player_id=player_id,
+    )
+    moved_event_card = types.SimpleNamespace(
+        id=event_id,
+        game_id=game_id,
+        type=CardType.EVENT,
+        name="E_CT",
+        description="Card Trade",
+        owner=CardOwner.DISCARD_PILE,
+        owner_player_id=None,
+    )
+
+    fake_last_card = _make_last_card(game_id)
+    move_calls: list[tuple[uuid.UUID, schemas.CardMoveIn]] = []
+
+    class FakeCardService:
+        @staticmethod
+        def get_card_by_id(db, cid):
+            if cid == event_id:
+                return fake_event_card
+            if cid == offered_card_id:
+                return fake_offered_card
+            return None
+
+        @staticmethod
+        def move_card(db, cid, move_in):
+            move_calls.append((cid, move_in))
+            assert cid == event_id
+            assert move_in.to_owner == CardOwner.DISCARD_PILE
+            return moved_event_card
+
+        @staticmethod
+        def see_top_discard(db, gid, n):
+            return [fake_last_card]
+
+        @staticmethod
+        def verify_cancellable_card(db, cid):
+            return False
+
+    monkeypatch.setattr("app.card.endpoints.CardService", FakeCardService)
+
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+
+    payload = {
+        "player_id": str(player_id),
+        "event_id": str(event_id),
+        "target_player": str(target_player),
+        "offered_card_id": str(offered_card_id),
+    }
+    if input_code is not None:
+        payload["requested_card_code"] = input_code
+
+    res = client.put(f"/cards/play/E_CT/{game_id}", json=payload)
+
+    assert res.status_code == 200
+    data = res.json()
+    assert data["id"] == str(event_id)
+    assert data["name"] == "E_CT"
+    assert data["owner"] == "DISCARD_PILE"
+
+    _, payload_arg = fake_manager.broadcast_to_game.call_args[0]
+    expected_code = input_code.upper() if input_code is not None else None
+    assert payload_arg["type"] == "playEvent"
+    assert payload_arg["data"]["target_player"] == str(target_player)
+    assert payload_arg["data"]["requested_card_code"] == expected_code
+    assert payload_arg["data"]["last_card"]["name"] == "Top Card"
+
+    assert len(move_calls) == 1
+    moved_cid, move_in = move_calls[0]
+    assert moved_cid == event_id
+    assert move_in.to_owner == CardOwner.DISCARD_PILE
+    assert move_in.player_id is None
+    assert change_calls == [
+        (
+            game_id,
+            TurnState.CARD_TRADE_PENDING,
+            {
+                "target_player_id": target_player,
+                "current_event_card_id": event_id,
+                "card_trade_offered_card_id": offered_card_id,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_status", "expected_detail"),
+    [
+        ("missing_fields", 400, "TargetPlayerAndOfferedCardAreRequired"),
+        ("target_not_in_game", 400, "GameNotFoundOrPlayerNotInGame"),
+        ("target_not_found", 404, "TargetPlayerNotFound"),
+    ],
+)
+def test_play_event_ct_error_cases(client, monkeypatch, scenario, expected_status, expected_detail):
+    """Valida los distintos errores de Card Trade."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    target_player = uuid.uuid4()
+
+    if scenario == "missing_fields":
+        players_ids = [player_id]
+        player_entities = {player_id: _make_player(player_id)}
+        payload = {
+            "player_id": str(player_id),
+            "event_id": str(uuid.uuid4()),
+        }
+    elif scenario == "target_not_in_game":
+        players_ids = [player_id]
+        player_entities = {
+            player_id: _make_player(player_id),
+            target_player: _make_player(target_player),
+        }
+        payload = {
+            "player_id": str(player_id),
+            "event_id": str(uuid.uuid4()),
+            "target_player": str(target_player),
+            "offered_card_id": str(uuid.uuid4()),
+        }
+    else:  # target_not_found
+        players_ids = [player_id, target_player]
+        player_entities = {player_id: _make_player(player_id)}  # target ausente
+        payload = {
+            "player_id": str(player_id),
+            "event_id": str(uuid.uuid4()),
+            "target_player": str(target_player),
+            "offered_card_id": str(uuid.uuid4()),
+        }
+
+    change_calls = _install_card_trade_services(
+        monkeypatch,
+        game_id=game_id,
+        player_id=player_id,
+        players_ids=players_ids,
+        player_entities=player_entities,
+    )
+    class FakeCardService:
+        @staticmethod
+        def verify_cancellable_card(db, cid):
+            return False
+
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+    monkeypatch.setattr("app.card.endpoints.CardService",FakeCardService)
+
+    res = client.put(f"/cards/play/E_CT/{game_id}", json=payload)
+    assert res.status_code == expected_status
+    assert res.json()["detail"] == expected_detail
+    fake_manager.broadcast_to_game.assert_not_awaited()
+    assert change_calls == []
+
+
+def test_play_event_ct_rejects_target_card_in_payload(client, monkeypatch):
+    """El endpoint rechaza si se envía target_card_id en la iniciación."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    target_player = uuid.uuid4()
+
+    change_calls = _install_card_trade_services(
+        monkeypatch,
+        game_id=game_id,
+        player_id=player_id,
+        players_ids=[player_id, target_player],
+        player_entities={
+            player_id: _make_player(player_id),
+            target_player: _make_player(target_player),
+        },
+    )
+    class FakeCardService:
+        @staticmethod
+        def verify_cancellable_card(db, cid):
+            return False
+
+    monkeypatch.setattr("app.card.endpoints.CardService",FakeCardService)
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+
+    payload = {
+        "player_id": str(player_id),
+        "event_id": str(uuid.uuid4()),
+        "target_player": str(target_player),
+        "offered_card_id": str(uuid.uuid4()),
+        "target_card_id": str(uuid.uuid4()),
+    }
+
+    res = client.put(f"/cards/play/E_CT/{game_id}", json=payload)
+    assert res.status_code == 400
+    assert res.json()["detail"] == "TargetCardMustBeSelectedByTargetPlayer"
+    fake_manager.broadcast_to_game.assert_not_awaited()
+    assert change_calls == []
+
+
+def test_resolve_card_trade_selection_success(client, monkeypatch):
+    """El jugador objetivo elige una carta válida y se completa el intercambio."""
+    game_id = uuid.uuid4()
+    requesting_player = uuid.uuid4()
+    target_player = uuid.uuid4()
+    event_id = uuid.uuid4()
+    offered_card_id = uuid.uuid4()
+    target_card_id = uuid.uuid4()
+
+    change_calls: list[tuple[uuid.UUID, TurnState, dict]] = []
+
+    offered_card = types.SimpleNamespace(
+        id=offered_card_id,
+        game_id=game_id,
+        owner=CardOwner.PLAYER,
+        owner_player_id=requesting_player,
+        type=CardType.DETECTIVE,
+        name="Offered",
+        description="Offered card",
+    )
+    target_card = types.SimpleNamespace(
+        id=target_card_id,
+        game_id=game_id,
+        owner=CardOwner.PLAYER,
+        owner_player_id=target_player,
+        type=CardType.DETECTIVE,
+        name="Target",
+        description="Target card",
+    )
+
+    moved_offered = types.SimpleNamespace(
+        id=offered_card_id,
+        game_id=game_id,
+        owner=CardOwner.PLAYER,
+        owner_player_id=target_player,
+        type=CardType.DETECTIVE,
+        name="Offered",
+        description="Offered card",
+    )
+    moved_target = types.SimpleNamespace(
+        id=target_card_id,
+        game_id=game_id,
+        owner=CardOwner.PLAYER,
+        owner_player_id=requesting_player,
+        type=CardType.DETECTIVE,
+        name="Target",
+        description="Target card",
+    )
+    event_card = types.SimpleNamespace(
+        id=event_id,
+        game_id=game_id,
+        owner=CardOwner.DISCARD_PILE,
+        owner_player_id=None,
+        name="E_CT",
+        description="Card Trade",
+        type=CardType.EVENT,
+    )
+
+    class FakeGameService:
+        def __init__(self, db):
+            pass
+
+        def get_game_by_id(self, game_id=None, gid=None):
+            return types.SimpleNamespace(players_ids=[requesting_player, target_player])
+
+        def get_turn_state(self, game_id=None, gid=None):
+            return types.SimpleNamespace(
+                turn_state=TurnState.CARD_TRADE_PENDING,
+                target_player_id=target_player,
+            )
+
+        def get_turn_state_entity(self, game_id=None, gid=None):
+            return types.SimpleNamespace(
+                current_event_card_id=event_id,
+                card_trade_offered_card_id=offered_card_id,
+                state=TurnState.CARD_TRADE_PENDING
+            )
+
+        def get_turn(self, game_id=None, gid=None):
+            return requesting_player
+
+        def change_turn_state(self, gid, new_state, **kwargs):
+            change_calls.append((gid, new_state, kwargs))
+
+    class FakeCardService:
+        @staticmethod
+        def get_card_by_id(db, cid):
+            if cid == offered_card_id:
+                return offered_card
+            if cid == target_card_id:
+                return target_card
+            if cid == event_id:
+                return event_card
+            return None
+
+        @staticmethod
+        def move_card(db, cid, move_in):
+            if cid == offered_card_id:
+                assert move_in.player_id == target_player
+                return moved_offered
+            if cid == target_card_id:
+                assert move_in.player_id == requesting_player
+                return moved_target
+            raise AssertionError("Unexpected card id")
+        @staticmethod
+        def card_trade(db, game_id, player_id, event_card_id, 
+                        target_player_id, offered_card_id, target_card_id):
+            return {
+                "discarded_card": event_card, 
+                "blackmailed_events": []
+            }
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+    monkeypatch.setattr("app.card.endpoints.CardService", FakeCardService)
+
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+
+    payload = {
+        "player_id": str(target_player),
+        "target_card_id": str(target_card_id),
+        "event_card_id": str(event_id),
+    }
+    res = client.put(f"/cards/play/E_CT/{game_id}/selection", json=payload)
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["offered_card"]["id"] == str(offered_card_id)
+    assert body["offered_card"]["owner"] == "PLAYER"
+    assert body["offered_card"]["owner_player_id"] == str(requesting_player)
+    assert body["received_card"]["id"] == str(target_card_id)
+    assert body["received_card"]["owner_player_id"] == str(target_player)
+    assert change_calls == [
+        (game_id, TurnState.DISCARDING, {})
+    ]
+
+
+def test_resolve_card_trade_selection_requires_context(client, monkeypatch):
+    """Debe devolver 409 si no hay intercambio pendiente."""
+    game_id = uuid.uuid4()
+    requesting_player = uuid.uuid4()
+    target_player = uuid.uuid4()
+    event_id = uuid.uuid4()
+
+    class FakeGameService:
+        def __init__(self, db):
+            pass
+
+        def get_game_by_id(self, game_id=None, gid=None):
+            return types.SimpleNamespace(players_ids=[requesting_player, target_player])
+
+        def get_turn_state(self, game_id=None, gid=None):
+            return types.SimpleNamespace(
+                turn_state=TurnState.CARD_TRADE_PENDING,
+                target_player_id=target_player,
+            )
+
+        def get_turn_state_entity(self, game_id=None, gid=None):
+            return types.SimpleNamespace(
+                current_event_card_id=event_id,
+                card_trade_offered_card_id=None,
+            )
+
+        def get_turn(self, game_id=None, gid=None):
+            return requesting_player
+
+        def change_turn_state(self, gid, new_state, **kwargs):
+            pass
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+    def _should_not_fetch(*_args, **_kwargs):
+        raise AssertionError("CardService.get_card_by_id should not be called")
+
+    monkeypatch.setattr(
+        "app.card.endpoints.CardService.get_card_by_id",
+        staticmethod(_should_not_fetch),
+    )
+
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+
+    payload = {
+        "player_id": str(target_player),
+        "target_card_id": str(uuid.uuid4()),
+        "event_card_id": str(event_id),
+    }
+    res = client.put(f"/cards/play/E_CT/{game_id}/selection", json=payload)
+    assert res.status_code == 409
+    assert res.json()["detail"] == "CardTradeNotPending"
+    fake_manager.broadcast_to_game.assert_not_awaited()
+
+
+def test_resolve_card_trade_selection_only_target_player(client, monkeypatch):
+    """Debe devolver 403 si otro jugador intenta elegir la carta."""
+    game_id = uuid.uuid4()
+    requesting_player = uuid.uuid4()
+    target_player = uuid.uuid4()
+    intruder = uuid.uuid4()
+    event_id = uuid.uuid4()
+    offered_card_id = uuid.uuid4()
+
+    class FakeGameService:
+        def __init__(self, db):
+            pass
+
+        def get_game_by_id(self, game_id=None, gid=None):
+            return types.SimpleNamespace(players_ids=[requesting_player, target_player, intruder])
+
+        def get_turn_state(self, game_id=None, gid=None):
+            return types.SimpleNamespace(
+                turn_state=TurnState.CARD_TRADE_PENDING,
+                target_player_id=target_player,
+            )
+
+        def get_turn_state_entity(self, game_id=None, gid=None):
+            return types.SimpleNamespace(
+                current_event_card_id=event_id,
+                card_trade_offered_card_id=offered_card_id,
+            )
+
+        def get_turn(self, game_id=None, gid=None):
+            return requesting_player
+
+        def change_turn_state(self, gid, new_state, **kwargs):
+            pass
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+    def _should_not_fetch(*_args, **_kwargs):
+        raise AssertionError("CardService.get_card_by_id should not be called")
+
+    monkeypatch.setattr(
+        "app.card.endpoints.CardService.get_card_by_id",
+        staticmethod(_should_not_fetch),
+    )
+
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+
+    payload = {
+        "player_id": str(intruder),
+        "target_card_id": str(uuid.uuid4()),
+        "event_card_id": str(event_id),
+    }
+    res = client.put(f"/cards/play/E_CT/{game_id}/selection", json=payload)
+    assert res.status_code == 403
+    assert res.json()["detail"] == "OnlyTargetPlayerCanSelectCard"
+    fake_manager.broadcast_to_game.assert_not_awaited()
 
 # --- Test draw_cards ---
 def test_draw_cards_deck_becomes_empty_sends_game_end(client, monkeypatch):
@@ -1508,3 +2380,630 @@ def test_draw_cards_deck_becomes_empty_sends_game_end(client, monkeypatch):
     assert args2[0] == game_id
     assert args2[1]["type"] == "playerDrawCards" 
     assert args2[1]["data"]["id_player"] == str(player_id)
+
+def test_play_event_invalid_turn_state(client, monkeypatch):
+    """
+    Debe devolver 400 si el estado no esta en IDLE
+    """
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+
+    fake_game = type("Game", (), {"id": game_id, "players_ids": [player_id]})()
+    fake_game_turn_state = MagicMock(turn_state = TurnState.DISCARDING)
+    monkeypatch.setattr(
+        "app.card.endpoints.GameService",
+        lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_game_turn_state,
+                                  "change_turn_state": lambda self, game_id, pid: None})()
+    )
+
+    payload = {
+        "player_id": str(player_id),
+        "event_id": str(uuid.uuid4()),
+        "set_id": str(uuid.uuid4()),
+    }
+
+    res = client.put(f"/cards/play/E_AV/{game_id}", json=payload)
+    assert res.status_code == 400
+    assert res.json()["detail"] == "Invalid accion for the game state"
+
+def test_discard_invalid_turn_state(client, monkeypatch):
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    fake_card_id = uuid.uuid4()
+
+    fake_game = MagicMock()
+    fake_game.players_ids = [player_id]
+    monkeypatch.setattr(
+        endpoints.GameService, 
+        "get_game_by_id", 
+        lambda db, game_id: fake_game
+    )
+    monkeypatch.setattr(
+        endpoints.GameService, 
+        "get_turn", 
+        lambda db, game_id: player_id
+    )
+    fake_game_turn_state = MagicMock(turn_state = TurnState.DRAWING_CARDS)
+    monkeypatch.setattr(
+        endpoints.GameService,
+        "get_turn_state",
+        lambda db, game_id: fake_game_turn_state
+    )
+    r = client.put(f"/cards/discard/{game_id}", json={
+        "player_id": str(player_id),
+        "id_cards":[str(fake_card_id)],
+    })
+    assert r.status_code == 400
+    body = r.json()
+    assert body["detail"] == "Invalid accion for the game state"
+
+#--------------------PLAY DEVIOUS CARDS TESTS--------------------
+
+def test_play_devious_card_sfp_happy_path(client, monkeypatch):
+    """Happy path: DV_SFP reveals secret and broadcasts."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    card_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+
+    # card must exist and be DEVIOUS
+    fake_card = types.SimpleNamespace(
+        id=card_id, 
+        game_id=game_id, 
+        type=CardType.DEVIOUS, 
+        name="DV_SFP"
+    )
+
+    # secret returned from SecretService.get_secret_by_id
+    fake_secret = types.SimpleNamespace(
+        id=secret_id, 
+        game_id=game_id, 
+        owner_player_id=player_id, 
+        revealed=False, 
+        name="S", 
+        description="d", 
+        type=SecretType.COMMON
+    )
+
+    class FakeCardService:
+        @staticmethod
+        def get_card_by_id(db, cid):
+            return fake_card if cid == card_id else None
+
+    class FakeSecretService:
+        @staticmethod
+        def get_secret_by_id(db, sid):
+            return fake_secret if sid == secret_id else None
+
+        @staticmethod
+        def social_faux_pas(
+            game_id_arg, 
+            player_id_arg, 
+            secret_id_arg, 
+            social_faux_pas_id_arg
+        ):
+            # emulate revealed secret return
+            fake_secret.revealed = True
+            return SecretOut(
+                id=secret_id, 
+                game_id=game_id, 
+                name="S", 
+                description="d", 
+                owner_player_id=player_id, 
+                revealed=True, 
+                role=fake_secret.type
+            )
+        
+    monkeypatch.setattr("app.card.endpoints.CardService", FakeCardService)
+    monkeypatch.setattr("app.card.endpoints.SecretService", FakeSecretService)
+
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+
+    res = client.put(f"/cards/devious/{card_id}", params={"game_id": str(game_id), "card_id": str(card_id), "secret_id": str(secret_id), "player_id": str(player_id)})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["id"] == str(secret_id)
+    assert body["revealed"] is True
+
+    fake_manager.broadcast_to_game.assert_awaited_once()
+
+
+def test_play_devious_card_not_devious_or_missing(client, monkeypatch):
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    card_id = uuid.uuid4()
+    secret_id = uuid.uuid4()
+
+    # card is not DEVIOUS
+    fake_card = types.SimpleNamespace(id=card_id, game_id=game_id, type=CardType.EVENT, name="NOT")
+
+    class FakeCardService:
+        @staticmethod
+        def get_card_by_id(db, cid):
+            return fake_card
+
+    monkeypatch.setattr("app.card.endpoints.CardService", FakeCardService)
+
+    res = client.put(f"/cards/devious/{card_id}", params={"game_id": str(game_id), "card_id": str(card_id), "secret_id": str(secret_id), "player_id": str(player_id)})
+    assert res.status_code == 404
+
+#--------- PLAY WITH CANCELATION METHODS ---------
+
+def test_play_event_cancelable_flow(client, monkeypatch):
+    """Flujo cuando la carta es cancelable (entra al bloque if verify_cancellable_card True)."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    event_id = uuid.uuid4()
+
+    # --- Fake game y estado ---
+    fake_game = types.SimpleNamespace(
+        id=game_id,
+        players_ids=[player_id],
+    )
+    fake_turn_state = MagicMock(turn_state=TurnState.IDLE)
+    fake_turn_state.is_cancelled = True  # simulamos que la cancelación se completa
+
+    # --- Mock de GameService ---
+    monkeypatch.setattr(
+        "app.card.endpoints.GameService",
+        lambda db: type("S", (), {"get_game_by_id": lambda self, game_id: fake_game,
+                                  "get_turn": lambda self, game_id: player_id,
+                                  "get_turn_state": lambda self, game_id: fake_turn_state,
+                                  "change_turn_state": lambda self, gid, *args, **kwargs: None})()
+    )
+
+    # --- PlayerService (jugador válido, no en desgracia social) ---
+    fake_player = types.SimpleNamespace(social_disgrace=False)
+    monkeypatch.setattr(
+        "app.card.endpoints.PlayerService",
+        lambda db: type("FakePlayerService", (), {
+            "get_player_entity_by_id": lambda self, pid: fake_player
+        })()
+    )
+
+    # --- CardService ---
+    fake_card = types.SimpleNamespace(description="Fake Event Card")
+    fake_moved_card = {
+        "id": str(event_id),
+        "game_id": str(game_id),
+        "type": "EVENT",
+        "name": "E_FAKE",
+        "owner": CardOwner.DISCARD_PILE.value,
+        "owner_player_id": str(player_id),
+        "description": "Fake Event Card",
+    }
+
+    monkeypatch.setattr(
+        "app.card.endpoints.CardService",
+        type(
+            "FakeCardService",
+            (),
+            {
+                # 👇 este método devuelve True para entrar al if
+                "verify_cancellable_card": staticmethod(lambda db, cid: True),
+                "get_card_by_id": staticmethod(lambda db, cid: fake_card),
+                "wait_for_cancellation": staticmethod(AsyncMock(return_value=None)),
+                "move_card": staticmethod(lambda db, cid, move_in: fake_moved_card),
+            },
+        ),
+    )
+
+    # --- Manager con AsyncMock para capturar broadcasts ---
+    fake_manager = types.SimpleNamespace(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", fake_manager)
+
+    # --- Payload del request ---
+    payload = {
+        "player_id": str(player_id),
+        "event_id": str(event_id),
+    }
+
+    # --- Ejecutamos el endpoint ---
+    response = client.put(f"/cards/play/E_FAKE/{game_id}", json=payload)
+
+    # --- Validaciones ---
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == str(event_id)
+    assert data["owner"] == "DISCARD_PILE"
+    assert data["owner_player_id"] == str(player_id)
+
+    # Deben haberse hecho 4 broadcasts
+    calls = fake_manager.broadcast_to_game.await_args_list
+    assert len(calls) == 5
+
+    # 1er broadcast: waitingForCancellationEvent
+    first_evt = calls[1].args[1]    
+    assert first_evt["type"] == "waitingForCancellationEvent"
+    assert first_evt["data"]["player_id"] == str(player_id)
+    assert first_evt["data"]["event_name"] == "Fake Event Card"
+
+    # 2do broadcast: cancelationStopped
+    second_evt = calls[4].args[1]
+    assert second_evt["type"] == "cancellationStopped"
+
+
+def test_play_no_so_fast_ok(client, monkeypatch):
+    """
+    Flujo exitoso:
+    - Juego y jugador válidos.
+    - Estado CANCELLED_CARD_PENDING.
+    - Carta E_NSF válida y del jugador.
+    """
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    card_id = uuid.uuid4()
+
+    fake_game = types.SimpleNamespace(
+        id=game_id,
+        players=[types.SimpleNamespace(id=player_id)],
+        turn_state=types.SimpleNamespace(state=TurnState.CANCELLED_CARD_PENDING)
+    )
+
+    fake_turn_state = types.SimpleNamespace(is_cancelled=False)
+    fake_card = types.SimpleNamespace(
+        id=card_id,
+        game_id=game_id,
+        type="EVENT",
+        name="E_NSF",
+        owner_player_id=player_id,
+        owner="PLAYER",
+        description="No So Fast"
+    )
+
+    class FakeGameService:
+        def __init__(self, db): pass
+        def get_game_entity_by_id(self, gid): return fake_game
+        def get_turn_state(self, gid): return fake_turn_state
+        def change_turn_state(self, **kwargs): pass
+
+    class FakeCardService:
+        @staticmethod
+        def get_card_by_id(db, cid): return fake_card
+        @staticmethod
+        def move_card(db, cid, move_in):
+            fake_card.owner = "DISCARD_PILE"
+            fake_card.owner_player_id = None
+            return fake_card
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+    monkeypatch.setattr("app.card.endpoints.CardService", FakeCardService)
+
+    payload = {"player_id": str(player_id), "card_id": str(card_id)}
+
+    r = client.put(f"/cards/play-no-so-fast/{game_id}", json=payload)
+
+    assert r.status_code == 200
+    data = r.json()
+    assert data["id"] == str(card_id)
+    assert data["owner"] == "DISCARD_PILE"
+    assert data["owner_player_id"] is None
+
+
+def test_play_no_so_fast_invalid_game(client, monkeypatch):
+    """Debe devolver 404 si el juego no existe."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "app.card.endpoints.GameService",
+        lambda db: type("S", (), {"get_game_entity_by_id": lambda self, gid: None})()
+    )
+
+    payload = {"player_id": str(player_id), "card_id": str(uuid.uuid4())}
+    r = client.put(f"/cards/play-no-so-fast/{game_id}", json=payload)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "GameNotFound"
+
+
+def test_play_no_so_fast_player_not_in_game(client, monkeypatch):
+    """Debe devolver 400 si el jugador no pertenece al juego."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    fake_game = types.SimpleNamespace(
+        id=game_id, players=[], turn_state=types.SimpleNamespace(state=TurnState.CANCELLED_CARD_PENDING)
+    )
+
+    class FakeGameService:
+        def __init__(self, db): pass
+        def get_game_entity_by_id(self, gid): return fake_game
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+
+    payload = {"player_id": str(player_id), "card_id": str(uuid.uuid4())}
+    r = client.put(f"/cards/play-no-so-fast/{game_id}", json=payload)
+    assert r.status_code == 400
+    assert r.json()["detail"] == "PlayerNotInGame"
+
+
+def test_play_no_so_fast_wrong_state(client, monkeypatch):
+    """Debe devolver 404 si el estado del juego no es CANCELLED_CARD_PENDING."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    fake_game = types.SimpleNamespace(
+        id=game_id, players=[types.SimpleNamespace(id=player_id)],
+        turn_state=types.SimpleNamespace(state=TurnState.IDLE)
+    )
+
+    class FakeGameService:
+        def __init__(self, db): pass
+        def get_game_entity_by_id(self, gid): return fake_game
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+
+    payload = {"player_id": str(player_id), "card_id": str(uuid.uuid4())}
+    r = client.put(f"/cards/play-no-so-fast/{game_id}", json=payload)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Wrong game state"
+
+
+def test_play_no_so_fast_wrong_card(client, monkeypatch):
+    """Debe devolver 400 si la carta no es E_NSF."""
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    card_id = uuid.uuid4()
+    fake_game = types.SimpleNamespace(
+        id=game_id,
+        players=[types.SimpleNamespace(id=player_id)],
+        turn_state=types.SimpleNamespace(state=TurnState.CANCELLED_CARD_PENDING)
+    )
+
+    fake_card = types.SimpleNamespace(
+        id=card_id,
+        game_id=game_id,
+        name="E_FAKE",
+        owner_player_id=player_id
+    )
+
+    class FakeGameService:
+        def __init__(self, db): pass
+        def get_game_entity_by_id(self, gid): return fake_game
+
+    class FakeCardService:
+        @staticmethod
+        def get_card_by_id(db, cid): return fake_card
+
+    monkeypatch.setattr("app.card.endpoints.GameService", FakeGameService)
+    monkeypatch.setattr("app.card.endpoints.CardService", FakeCardService)
+
+    payload = {"player_id": str(player_id), "card_id": str(card_id)}
+    r = client.put(f"/cards/play-no-so-fast/{game_id}", json=payload)
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Wrong card"
+
+@pytest.fixture
+def pys_endpoint_setup(monkeypatch):
+    """Configura mocks de GameService y CardService para el endpoint /vote."""
+    mock_game_service = MagicMock()
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.players = [MagicMock() for _ in range(4)]
+    mock_game_entity.current_turn = uuid.uuid4()
+    mock_game_service.get_game_entity_by_id.return_value = mock_game_entity
+    mock_game_service.submit_player_vote.return_value = None
+    
+    mock_card_service = MagicMock()
+    mock_card_service.execute_pys_vote = AsyncMock(return_value=uuid.uuid4())
+    
+    mock_manager = MagicMock()
+    mock_manager.broadcast_to_game = AsyncMock()
+
+    monkeypatch.setattr("app.card.endpoints.GameService", lambda db: mock_game_service)
+    monkeypatch.setattr("app.card.endpoints.CardService", lambda: mock_card_service)
+    monkeypatch.setattr("app.card.endpoints.manager", mock_manager)
+
+    return {
+        "mock_game_service": mock_game_service,
+        "mock_card_service": mock_card_service,
+        "mock_manager": mock_manager,
+        "mock_game_entity": mock_game_entity
+    }
+
+# --- Tests del endpoint /vote ---
+
+def test_submit_vote_ok_not_last_voter(client, pys_endpoint_setup):
+    """
+    Prueba que un voto normal (no el último) llama a submit_player_vote,
+    envía 'playerHasVoted' y NO llama a execute_pys_vote.
+    """
+    mock_game_service = pys_endpoint_setup["mock_game_service"]
+    mock_card_service = pys_endpoint_setup["mock_card_service"]
+    mock_manager = pys_endpoint_setup["mock_manager"]
+    
+    # Simulamos que NO es el último voto
+    mock_card_service.check_if_all_players_voted.return_value = False
+    
+    game_id = uuid.uuid4()
+    payload = {"player_id": str(uuid.uuid4()), "target_player_id": str(uuid.uuid4())}
+
+    response = client.put(f"/cards/vote/{game_id}", json=payload)
+    
+    assert response.status_code == 200
+    
+    # Verificar que se guardó el voto
+    mock_game_service.submit_player_vote.assert_called_once()
+    # Verificar que se comprobó si era el último
+    mock_card_service.check_if_all_players_voted.assert_called_once()
+    
+    # Verificar que NO se ejecutó el recuento
+    mock_card_service.execute_pys_vote.assert_not_called()
+    
+    # Verificar que se envió el broadcast 'playerHasVoted'
+    mock_manager.broadcast_to_game.assert_called_once_with(
+        game_id,
+        {"type": "playerHasVoted", "data": {"player_id": payload["player_id"]}}
+    )
+
+def test_submit_vote_ok_last_voter_triggers_execution(client, pys_endpoint_setup):
+    """
+    Prueba que el ÚLTIMO voto llama a submit, check, Y ejecuta
+    el recuento (execute_pys_vote) y envía todos los broadcasts.
+    """
+    mock_game_service = pys_endpoint_setup["mock_game_service"]
+    mock_card_service = pys_endpoint_setup["mock_card_service"]
+    mock_manager = pys_endpoint_setup["mock_manager"]
+    mock_game_entity = pys_endpoint_setup["mock_game_entity"]
+    
+    # Simulamos que SÍ es el último voto
+    mock_card_service.check_if_all_players_voted.return_value = True
+    
+    # El recuento devuelve un ganador
+    fake_winner_id = uuid.uuid4()
+    mock_card_service.execute_pys_vote.return_value = fake_winner_id
+
+    game_id = uuid.uuid4()
+    payload = {"player_id": str(uuid.uuid4()), "target_player_id": str(uuid.uuid4())}
+
+    response = client.put(f"/cards/vote/{game_id}", json=payload)
+    
+    assert response.status_code == 200
+    
+    # Verificar que se guardó el voto
+    mock_game_service.submit_player_vote.assert_called_once()
+    # Verificar que se comprobó si era el último
+    mock_card_service.check_if_all_players_voted.assert_called_once()
+    
+    # Verificar que SÍ se ejecutó el recuento
+    mock_card_service.execute_pys_vote.assert_called_once_with(ANY, game_id, mock_game_entity)
+    
+    # Verificar que se enviaron los 3 broadcasts
+    assert mock_manager.broadcast_to_game.await_count == 3
+    
+    mock_manager.broadcast_to_game.assert_any_await(
+        game_id,
+        {"type": "playerHasVoted", "data": {"player_id": payload["player_id"]}}
+    )
+    mock_manager.broadcast_to_game.assert_any_await(
+        game_id,
+        {"type": "votingPhaseExecuted", "data": {"player_to_reveal_id": str(fake_winner_id)}}
+    )
+    mock_manager.broadcast_to_game.assert_any_await(
+        game_id,
+        {"type": "turnStateChanged", "data": ANY}
+    )
+
+def test_submit_vote_fails_if_service_fails(client, pys_endpoint_setup):
+    """Prueba que si submit_player_vote falla (ej: 403), el endpoint devuelve ese error."""
+    mock_game_service = pys_endpoint_setup["mock_game_service"]
+    
+    # Simulamos que el servicio falla (por ejemplo: jugador ya votó)
+    error_detail = "Player has already voted"
+    mock_game_service.submit_player_vote.side_effect = HTTPException(status_code=403, detail=error_detail)
+
+    game_id = uuid.uuid4()
+    payload = {"player_id": str(uuid.uuid4()), "target_player_id": str(uuid.uuid4())}
+
+    response = client.put(f"/cards/vote/{game_id}", json=payload)
+    
+    assert response.status_code == 403
+    assert response.json()["detail"] == error_detail
+
+def make_mock_card(
+    id=None, 
+    game_id=None, 
+    name="Test Card", 
+    owner=None, 
+    owner_player_id=None,
+    type=None,
+    **kwargs
+) -> MagicMock:
+    """Crea un mock simple de un objeto Card con atributos comunes."""
+    card = MagicMock(spec=Card)
+    card.id = id or uuid.uuid4()
+    card.game_id = game_id
+    card.name = name
+    card.owner = owner
+    card.owner_player_id = owner_player_id
+    card.type = type
+    
+    # Asigna cualquier otro kwarg
+    for key, value in kwargs.items():
+        setattr(card, key, value)
+        
+    return card
+
+@pytest.fixture
+def base_setup(monkeypatch):
+    mock_manager = MagicMock(broadcast_to_game=AsyncMock())
+    monkeypatch.setattr("app.card.endpoints.manager", mock_manager)
+    return {"manager": mock_manager}
+
+def test_select_card_for_passing_trigger_sfp(client, monkeypatch, base_setup):
+    """
+    Prueba que si 'all_players_selected' es True y el estado
+    es 'PENDING_DEVIOUS', se envía el broadcast 'sfpPending'.
+    """
+    game_id = uuid.uuid4()
+    p1_id, p2_id = uuid.uuid4(), uuid.uuid4()
+    sfp_players_list = [p1_id, p2_id]
+    
+    # Mock GameService
+    mock_game_service = MagicMock()
+
+    mock_game_service.get_game_by_id.return_value = MagicMock(
+        players_ids=sfp_players_list
+    )
+
+    mock_game_entity = MagicMock(spec=Game, players=[
+        MagicMock(id=p1_id),
+        MagicMock(id=p2_id)
+    ])
+    mock_game_service.get_game_entity_by_id.return_value = mock_game_entity
+
+    mock_turn_state_ENTITY = MagicMock(
+        spec=GameTurnState,
+        state=TurnState.PASSING_CARDS 
+    )
+    mock_game_service.get_turn_state_entity.return_value = mock_turn_state_ENTITY
+
+    mock_game_state_dto = MagicMock(spec=GameTurnStateOut)
+    mock_game_state_dto.turn_state = TurnState.PENDING_DEVIOUS
+    mock_game_state_dto.sfp_players = sfp_players_list
+    mock_game_service.get_turn_state.return_value = mock_game_state_dto
+    
+    # Mock CardService
+    mock_card_service = MagicMock()
+    mock_card = schemas.CardOut(
+    id=uuid.uuid4(),
+    type="EVENT",
+    game_id=game_id,
+    name="Test Card",
+    owner=CardOwner.PLAYER,
+    owner_player_id=p1_id,
+    description="Mocked test card",
+)
+    mock_card_service.select_card_for_passing.return_value = mock_card
+    mock_card_service.check_if_all_players_selected.return_value = True
+    mock_card_service.execute_dead_card_folly_swap.return_value = []
+    
+    monkeypatch.setattr("app.card.endpoints.GameService", lambda db: mock_game_service)
+    monkeypatch.setattr("app.card.endpoints.CardService", lambda: mock_card_service)
+    
+    fake_secret = MagicMock()
+    fake_secret.id = uuid.uuid4()
+    fake_secret.name = "Test"
+    fake_secret.role = SecretType.COMMON
+    fake_secret.description = "Test"
+
+    monkeypatch.setattr("app.card.endpoints.SecretService.change_secret_status", fake_secret)
+
+    mock_manager = base_setup["manager"]
+    
+    payload = {"player_id": str(p1_id), "card_id": str(uuid.uuid4())}
+    response = client.put(f"/cards/passing/{game_id}", json=payload)
+    
+    assert response.status_code == 200
+    
+    mock_manager.broadcast_to_game.assert_any_await(
+        game_id,
+        {
+            "type": "sfpPending",
+            "data": {"players_id": sfp_players_list}
+        }
+    )
+    
+    assert not any(
+        call.args[1].get("type") == "timerResumed" 
+        for call in mock_manager.broadcast_to_game.await_args_list
+    )

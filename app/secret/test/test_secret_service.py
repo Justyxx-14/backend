@@ -12,7 +12,7 @@ from app.secret.service import SecretService
 from app.secret.models import Secrets
 from app.secret.enums import SecretType
 from app.player.models import Player
-import app.card.models  # noqa: F401
+from app.secret.schemas import SecretOut
 from app.player.service import PlayerService
 from app.game.models import Game
 
@@ -138,7 +138,7 @@ def test_deal_secrets_assigns_correctly(db_session, sample_game_and_players):
 
     for pid, secrets_dto in result.items():
         assert len(secrets_dto) == 3, f"El jugador {pid} debería tener 3 secretos, pero tiene {len(secrets_dto)}"
-        assert all(isinstance(s, SecretOutDTO) for s in secrets_dto)
+        assert all(isinstance(s, SecretOut) for s in secrets_dto)
         for s in secrets_dto:
             assert s.owner_player_id == pid
 
@@ -303,7 +303,7 @@ def test_get_secrets_by_player_id_returns_assigned(db_session, sample_game_and_p
     player_secrets_dto = SecretService.get_secrets_by_player_id(db_session, pid)
 
     assert all(s.owner_player_id == pid for s in player_secrets_dto)
-    assert all(isinstance(s, SecretOutDTO) for s in player_secrets_dto)
+    assert all(isinstance(s, SecretOut) for s in player_secrets_dto)
 
 
 # ---------------------------

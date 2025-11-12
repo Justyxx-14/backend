@@ -9,13 +9,14 @@ from pathlib import Path
 from .enums import SecretType
 from .dtos import SecretInDTO, SecretOutDTO
 from app.player.service import PlayerService
+from app.secret.schemas import SecretOut
 
 
 class SecretService:
 
     @staticmethod
-    def _to_dto(secret: models.Secrets) -> SecretOutDTO:
-        return SecretOutDTO(
+    def _to_dto(secret: models.Secrets) -> SecretOut:
+        return SecretOut(
             id=secret.id,
             name=secret.name,
             role=secret.role,

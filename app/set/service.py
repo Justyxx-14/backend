@@ -13,9 +13,13 @@ from app.game.service import GameService
 from app.game.schemas import GameEndReason
 from app.secret.enums import SecretType
 from app.secret.models import Secrets
+from app.secret.schemas import SecretOut
 from app.secret.service import SecretService
 from app.card.service import CardService
+from app.player.service import PlayerService
 from app.player.models import Player
+from app.set.exceptions import SetNotFound  
+from app.card.exceptions import CardsNotFoundOrInvalidException
 
 
 class SetService:
@@ -202,6 +206,7 @@ class SetService:
     def play_set(
         self,
         set_id: UUID,
+        card_id: UUID|None,
         target_player_id: UUID,
         secret_id: UUID
     ) -> SetPlayResult:
@@ -224,54 +229,97 @@ class SetService:
         else: # Set para revelar
             if target_secret.revealed:
                 raise ValueError("The secret is already revealed")
-      
-        game_id = existing_set.game_id
-        set_out_dto = self._to_dto(existing_set)
-        game_service = GameService(self.db)
-        end_game_result: EndGameResult | None = None
+            
+        if card_id != None: #carta detective ariadne
+            card_data = CardService.get_card_by_id(self.db, card_id)
+            if not card_data or card_data.name != "D_AO":
+                raise ValueError("Not valid card to play the set")
+            game_id = card_data.game_id
+            game_service = GameService(self.db)
+            end_game_result: EndGameResult | None = None
 
-        updated_secret_dto = service_secret.change_secret_status(self.db, secret_id)
+            updated_secret_dto = service_secret.change_secret_status(self.db, secret_id)
 
-        if existing_set.type != SetType.PP and updated_secret_dto.revealed:
+            if updated_secret_dto.revealed:
 
-            # Si el secreto es el asesino
-            if updated_secret_dto.role == SecretType.MURDERER:
-                end_game_result = game_service.end_game(
-                    game_id, GameEndReason.MURDERER_REVEALED
-                )
+                # Si el secreto es el asesino
+                if updated_secret_dto.role == SecretType.MURDERER:
+                    end_game_result = game_service.end_game(
+                        game_id, GameEndReason.MURDERER_REVEALED
+                    )
+                else:
+                    murderer_team_ids = SecretService.get_murderer_team_ids(self.db, game_id)
 
-            else:               
-                murderer_team_ids = SecretService.get_murderer_team_ids(self.db, game_id)
-                
-                unrevealed_detective_secrets_count = self.db.query(func.count(Secrets.id)).filter(
-                    Secrets.game_id == game_id,
-                    Secrets.revealed == False,
-                    Secrets.owner_player_id.notin_(murderer_team_ids) 
-                ).scalar()
-                # Todos los secretos de los "detectives" se revelaron
-                if unrevealed_detective_secrets_count == 0:
-        
-                    # Comprobamos que el asesino siga oculto
-                    murderer_role_secret = self.db.query(Secrets).filter(
+                    unrevealed_detective_secrets_count = self.db.query(func.count(Secrets.id)).filter(
                         Secrets.game_id == game_id,
-                        Secrets.role == SecretType.MURDERER
-                    ).first()
-                    
-                    if murderer_role_secret and not murderer_role_secret.revealed:
-                        # Ganan los asesinos
-                        end_game_result = game_service.end_game(
-                            game_id, GameEndReason.SECRETS_REVEALED
-                        )
+                        Secrets.revealed == False,
+                        Secrets.owner_player_id.notin_(murderer_team_ids)
+                    ).scalar()   
 
-        return SetPlayResult(set_out=set_out_dto, end_game_result=end_game_result)
+                    if unrevealed_detective_secrets_count == 0:
+
+                        murderer_role_secret = self.db.query(Secrets).filter(
+                            Secrets.game_id == game_id,
+                            Secrets.role == SecretType.MURDERER
+                        ).first()
+                    
+                        if murderer_role_secret and not murderer_role_secret.revealed:
+                            # Ganan los asesinos
+                            end_game_result = game_service.end_game(
+                                game_id, GameEndReason.SECRETS_REVEALED
+                            )
+            set_data = self._to_dto(set_id)
+            return SetPlayResult(set_out = set_data, end_game_result = end_game_result)
+
+        else:
+
+            game_id = existing_set.game_id
+            set_out_dto = self._to_dto(existing_set)
+            game_service = GameService(self.db)
+            end_game_result: EndGameResult | None = None
+
+            updated_secret_dto = service_secret.change_secret_status(self.db, secret_id)
+
+            if existing_set.type != SetType.PP and updated_secret_dto.revealed:
+
+                # Si el secreto es el asesino
+                if updated_secret_dto.role == SecretType.MURDERER:
+                    end_game_result = game_service.end_game(
+                        game_id, GameEndReason.MURDERER_REVEALED
+                    )
+
+                else:               
+                    murderer_team_ids = SecretService.get_murderer_team_ids(self.db, game_id)
+                
+                    unrevealed_detective_secrets_count = self.db.query(func.count(Secrets.id)).filter(
+                        Secrets.game_id == game_id,
+                        Secrets.revealed == False,
+                        Secrets.owner_player_id.notin_(murderer_team_ids) 
+                    ).scalar()
+                    # Todos los secretos de los "detectives" se revelaron
+                    if unrevealed_detective_secrets_count == 0:
+        
+                        # Comprobamos que el asesino siga oculto
+                        murderer_role_secret = self.db.query(Secrets).filter(
+                            Secrets.game_id == game_id,
+                            Secrets.role == SecretType.MURDERER
+                        ).first()
+                    
+                        if murderer_role_secret and not murderer_role_secret.revealed:
+                            # Ganan los asesinos
+                            end_game_result = game_service.end_game(
+                                game_id, GameEndReason.SECRETS_REVEALED
+                            )
+
+            return SetPlayResult(set_out=set_out_dto, end_game_result=end_game_result)
     
     def add_card_to_set(
-            self, 
-            game_id:UUID, 
-            player_id:UUID,
-            set_id: UUID,
-            card_id: UUID
-    )-> SetOut:
+        self, 
+        game_id: UUID, 
+        player_id: UUID,
+        set_id: UUID,
+        card_id: UUID
+    ) -> SetOut:
         """
         Agrega una carta detective a un set existente del mismo jugador.
         Valida compatibilidad de tipo y propiedad antes de actualizar.
@@ -279,38 +327,63 @@ class SetService:
         """
         set_played = self.db.query(SetModel).filter(SetModel.id == set_id).first()
         card_to_add = CardService.get_card_by_id(self.db, card_id)
-        if (not card_to_add
-            or card_to_add.game_id != game_id
-            or card_to_add.owner_player_id != player_id):
-            raise ValueError("NotValidCardID")
 
-        if (not set_played
-            or set_played.game_id != game_id
-            or set_played.owner_player_id != player_id):
+        # --- Validaciones básicas ---
+        if not card_to_add:
+            raise ValueError("Card not found")
+
+        # Caso especial: Ariadne puede agregarse a cualquier set
+        if card_to_add.name == "D_AO":
+            # Solo aseguramos que la carta exista y sea detective
+            if card_to_add.type != "DETECTIVE":
+                raise ValueError("NotValidCardID")
+            card_to_add.owner = CardOwner.SET
+            try:
+                self.db.add(card_to_add)
+                self.db.commit()
+            except SQLAlchemyError as exc:
+                self.db.rollback()
+                raise ValueError("Failed to add card to set") from exc
+            return SetService._to_dto(set_played)
+
+        # --- Validaciones normales ---
+        if card_to_add.game_id != game_id or card_to_add.owner_player_id != player_id:
+            raise ValueError("NotValidCardID")
+        if not set_played or set_played.game_id != game_id or set_played.owner_player_id != player_id:
             raise ValueError("NotValidSetToAdd")
-        
-        if (not card_to_add.type == "DETECTIVE"
-            or card_to_add.name == "D_HQW"):
+
+        if card_to_add.type != "DETECTIVE" or card_to_add.name == "D_HQW":
             raise ValueError("NotValidCardID")
 
-        if set_played.type == "HARLEY_MS" and card_to_add.name != "D_MS":
-            raise ValueError("NotMatchingSetType")
-        if set_played.type == "SIBLINGS_B" and card_to_add.name not in ("D_TB", "D_TUB"):
-            raise ValueError("NotMatchingSetType")
-        if set_played.type != self._to_set_type(card_to_add.name):
-            raise ValueError("NotMatchingSetType")
-        
-        card_to_add.owner=CardOwner.SET
-        
+        # --- Reglas especiales ---
+        # Hermanos
+        if set_played.type in ("SIBLINGS_B"):
+            if card_to_add.name not in ("D_TB", "D_TUB"):
+                raise ValueError("NotMatchingSetType")
+
+        # Harley
+        elif set_played.type == "HARLEY_MS":
+            if card_to_add.name != "D_MS":
+                raise ValueError("NotMatchingSetType")
+
+        # Set normal
+        else:
+            expected_type = self._to_set_type(card_to_add.name)
+            if set_played.type != expected_type:
+                raise ValueError("NotMatchingSetType")
+
+        # --- Actualización ---
+        card_to_add.owner = CardOwner.SET
         try:
             self.db.add(card_to_add)
             self.db.commit()
         except SQLAlchemyError as exc:
             self.db.rollback()
             raise ValueError("Failed to add card to set") from exc
-        
 
         return SetService._to_dto(set_played)
+
+
 
     def change_set_owner(self, game_id: UUID, set_id: UUID, new_owner_id: UUID) -> SetOut:
         existing_set = self.db.query(SetModel).filter(
@@ -342,3 +415,55 @@ class SetService:
             game_id=existing_set.game_id,
             owner_player_id=existing_set.owner_player_id
         )
+
+    @staticmethod
+    def verify_cancellable_set(
+        db: Session,
+        set_id: UUID
+    ) -> bool:
+        """
+        Verifica si un set puede ser cancelado.
+        """
+
+        target_set = SetService.get_set_by_id(db, set_id)
+
+        if not target_set:
+            raise SetNotFound(set_id)
+
+        # Set no cancelable:
+        if target_set.type == SetType.SIBLINGS_B:
+            return False
+
+        # Todos los demás sets son cancelables
+        return True
+    
+    @staticmethod
+    def verify_cancellable_new_set(
+        db: Session,
+        card_ids: list[UUID]
+    ) -> bool:
+        """
+        Verifica si el set que se está por armar es cancelable.
+
+        Devuelve False solo si TODAS las cartas tienen nombre
+        exclusivamente entre {"D_TB", "D_TUB"}.
+
+        En cualquier otro caso devuelve True.
+        """
+
+        cards = []
+        for cid in card_ids:
+            card = CardService.get_card_by_id(db, cid)
+            if not card:
+                raise CardsNotFoundOrInvalidException(f"Card {cid} not found")
+            cards.append(card)
+
+        non_cancellable_names = {"D_TB", "D_TUB"}
+
+        # Si todas las cartas son de esos dos nombres → set NO cancelable
+        if all(card.name in non_cancellable_names for card in cards) and len(cards) == 2:
+            return False
+
+        # Si hay al menos una distinta → set cancelable
+        # No se manejan errores de validación de set aquí
+        return True

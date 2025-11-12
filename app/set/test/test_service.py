@@ -5,15 +5,19 @@ import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.card.enums import CardType, CardOwner
+from app.card.service import CardService
+from app.card.exceptions import CardsNotFoundOrInvalidException
 from app.set.dtos import SetIn, SetPlayResult
 from app.set.enums import SetType
 from app.set.models import Set as SetModel
 from app.set.service import SetService
+from app.set.exceptions import SetNotFound
 from app.secret.enums import SecretType
 from app.secret.dtos import SecretOutDTO
 from app.secret.models import Secrets
 from app.game.schemas import EndGameResult, GameEndReason
 from types import SimpleNamespace
+
 
 
 class DummyCard:
@@ -425,11 +429,13 @@ def set_service(db_session):
     return SetService(db_session)
 
 
+
 def test_play_set_not_found_raises(set_service, db_session):
     db_session.query.return_value.filter.return_value.first.return_value = None
 
     with pytest.raises(ValueError, match="Set not found"):
-        set_service.play_set(uuid.uuid4(), uuid.uuid4(), uuid.uuid4())
+        set_service.play_set(uuid.uuid4(), None, uuid.uuid4(), uuid.uuid4())  # Agregado None como card_id
+
 
 def test_play_set_secret_not_belongs_to_target(set_service, db_session):
     fake_set = SimpleNamespace(id=uuid.uuid4())
@@ -438,7 +444,8 @@ def test_play_set_secret_not_belongs_to_target(set_service, db_session):
     fake_secret = SimpleNamespace(owner_player_id=uuid.uuid4(), revealed=False)
     with patch("app.set.service.SecretService.get_secret_by_id", return_value=fake_secret):
         with pytest.raises(ValueError, match="The secret must belong to the target player"):
-            set_service.play_set(fake_set.id, uuid.uuid4(), uuid.uuid4())
+            set_service.play_set(fake_set.id, None, uuid.uuid4(), uuid.uuid4())  # Agregado None como card_id
+
 
 def test_play_set_hide_secret_but_hidden_secret_raises(set_service, db_session):
     fake_set = SimpleNamespace(id=uuid.uuid4(), type=SetType.PP)
@@ -452,9 +459,10 @@ def test_play_set_hide_secret_but_hidden_secret_raises(set_service, db_session):
         patch("app.set.service.SecretService.change_secret_status") as mock_change_status,
     ):
         with pytest.raises(ValueError, match="The secret is already hidden"):
-            set_service.play_set(fake_set.id, target_player_id, uuid.uuid4())
+            set_service.play_set(fake_set.id, None, target_player_id, uuid.uuid4())  # Agregado None como card_id
 
     mock_change_status.assert_not_called()
+
 
 def test_play_set_hide_secret_success_when_revealed(set_service, db_session):
     fake_set = SimpleNamespace(
@@ -486,7 +494,7 @@ def test_play_set_hide_secret_success_when_revealed(set_service, db_session):
     with (
         patch("app.set.service.SecretService", return_value=mock_secret_service_instance)
     ):
-        result = set_service.play_set(fake_set.id, target_player_id, fake_secret.id)
+        result = set_service.play_set(fake_set.id, None, target_player_id, fake_secret.id)  # Agregado None como card_id
 
     mock_secret_service_instance.get_secret_by_id.assert_called_once_with(db_session, fake_secret.id)
     mock_secret_service_instance.change_secret_status.assert_called_once_with(db_session, fake_secret.id)
@@ -494,6 +502,7 @@ def test_play_set_hide_secret_success_when_revealed(set_service, db_session):
     assert isinstance(result, SetPlayResult)
     assert result.set_out.id == fake_set.id
     assert result.end_game_result is None
+
 
 def test_play_set_normal_success_when_hidden(set_service, db_session):
     fake_set = MagicMock(
@@ -533,7 +542,7 @@ def test_play_set_normal_success_when_hidden(set_service, db_session):
         patch("app.set.service.SecretService", return_value=mock_secret_service_instance),
         patch("app.set.service.GameService", return_value=mock_game_service_instance)
     ):
-        result = set_service.play_set(fake_set.id, target_player_id, fake_secret.id)
+        result = set_service.play_set(fake_set.id, None, target_player_id, fake_secret.id)  # Agregado None como card_id
 
     mock_secret_service_instance.get_secret_by_id.assert_called_once_with(db_session, fake_secret.id)
     mock_secret_service_instance.change_secret_status.assert_called_once_with(db_session, fake_secret.id)
@@ -558,7 +567,7 @@ def base_data():
         "secret_id": secret_id,
     }
 
-# --- Test: Revelar Secreto Normal (Sin Fin de Juego) ---
+
 def test_play_set_reveal_common_secret_success(set_service, db_session, base_data):
     mock_set = MagicMock(
         spec=SetModel, 
@@ -593,7 +602,7 @@ def test_play_set_reveal_common_secret_success(set_service, db_session, base_dat
     with patch("app.set.service.SecretService", return_value=mock_secret_service_instance), \
          patch("app.set.service.GameService", return_value=mock_game_service_instance):
 
-        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+        result = set_service.play_set(base_data["set_id"], None, base_data["target_player_id"], base_data["secret_id"])  # Agregado None como card_id
 
     mock_secret_service_instance.get_secret_by_id.assert_called_once_with(db_session, base_data["secret_id"])
     mock_secret_service_instance.change_secret_status.assert_called_once_with(db_session, base_data["secret_id"])
@@ -602,7 +611,7 @@ def test_play_set_reveal_common_secret_success(set_service, db_session, base_dat
     assert result.set_out.id == base_data["set_id"]
     assert result.end_game_result is None
 
-# --- Test: Revelar Secreto de Asesino (Termina Juego) ---
+
 def test_play_set_reveal_murderer_secret_ends_game(set_service, db_session, base_data):
     mock_set = MagicMock(
         spec=SetModel, 
@@ -637,7 +646,7 @@ def test_play_set_reveal_murderer_secret_ends_game(set_service, db_session, base
     with patch("app.set.service.SecretService", return_value=mock_secret_service_instance), \
          patch("app.set.service.GameService", return_value=mock_game_service_instance):
 
-        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+        result = set_service.play_set(base_data["set_id"], None, base_data["target_player_id"], base_data["secret_id"])  # Agregado None como card_id
 
     mock_secret_service_instance.change_secret_status.assert_called_once()
     mock_game_service_instance.end_game.assert_called_once_with(base_data["game_id"], GameEndReason.MURDERER_REVEALED)
@@ -645,7 +654,7 @@ def test_play_set_reveal_murderer_secret_ends_game(set_service, db_session, base
     assert result.set_out.id == base_data["set_id"]
     assert result.end_game_result == mock_end_game_dto 
 
-# --- Test: Revelar Último Secreto de Detective (Termina Juego) ---
+
 def test_play_set_reveal_last_detective_secret_ends_game(set_service, db_session, base_data):
     mock_set = MagicMock(
         spec=SetModel, 
@@ -694,7 +703,7 @@ def test_play_set_reveal_last_detective_secret_ends_game(set_service, db_session
          patch("app.set.service.GameService", return_value=mock_game_service_instance), \
          patch("app.set.service.SecretService.get_murderer_team_ids", return_value={murderer_id}) as mock_static_get_ids:
 
-        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+        result = set_service.play_set(base_data["set_id"], None, base_data["target_player_id"], base_data["secret_id"])  # Agregado None como card_id
 
     mock_secret_service_instance.change_secret_status.assert_called_once()
     mock_static_get_ids.assert_called_once_with(db_session, base_data["game_id"])
@@ -704,7 +713,7 @@ def test_play_set_reveal_last_detective_secret_ends_game(set_service, db_session
     assert isinstance(result, SetPlayResult)
     assert result.end_game_result == mock_end_game_dto
 
-# --- Test: Usar Parker Pyne (PP) para Ocultar Secreto (Sin Fin de Juego) ---
+
 def test_play_set_pp_hide_secret_success(set_service, db_session, base_data):
     mock_set_pp = MagicMock(
         spec=SetModel, 
@@ -735,7 +744,7 @@ def test_play_set_pp_hide_secret_success(set_service, db_session, base_data):
     with patch("app.set.service.SecretService", return_value=mock_secret_service_instance), \
          patch("app.set.service.GameService", return_value=mock_game_service_instance):
 
-        result = set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+        result = set_service.play_set(base_data["set_id"], None, base_data["target_player_id"], base_data["secret_id"])  # Agregado None como card_id
 
     mock_secret_service_instance.change_secret_status.assert_called_once()
     mock_game_service_instance.end_game.assert_not_called()
@@ -743,7 +752,7 @@ def test_play_set_pp_hide_secret_success(set_service, db_session, base_data):
     assert result.set_out.id == mock_set_pp.id 
     assert result.end_game_result is None
 
-# --- Tests de Errores de Validación ---
+
 def test_play_set_secret_not_found_raises(set_service, db_session, base_data):
     mock_set = MagicMock(spec=SetModel, id=base_data["set_id"], type=SetType.MS)
     db_session.query.return_value.filter.return_value.first.return_value = mock_set
@@ -753,7 +762,8 @@ def test_play_set_secret_not_found_raises(set_service, db_session, base_data):
 
     with patch("app.set.service.SecretService", return_value=mock_secret_service_instance):
         with pytest.raises(ValueError, match="Secret not found"):
-            set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+            set_service.play_set(base_data["set_id"], None, base_data["target_player_id"], base_data["secret_id"])  # Agregado None como card_id
+
 
 def test_play_set_secret_wrong_owner_raises(set_service, db_session, base_data):
     mock_set = MagicMock(spec=SetModel, id=base_data["set_id"], type=SetType.MS)
@@ -766,7 +776,8 @@ def test_play_set_secret_wrong_owner_raises(set_service, db_session, base_data):
 
     with patch("app.set.service.SecretService", return_value=mock_secret_service_instance):
         with pytest.raises(ValueError, match="The secret must belong to the target player"):
-            set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+            set_service.play_set(base_data["set_id"], None, base_data["target_player_id"], base_data["secret_id"])  # Agregado None como card_id
+
 
 def test_play_set_reveal_already_revealed_raises(set_service, db_session, base_data):
     mock_set = MagicMock(spec=SetModel, id=base_data["set_id"], type=SetType.MS) 
@@ -778,4 +789,157 @@ def test_play_set_reveal_already_revealed_raises(set_service, db_session, base_d
 
     with patch("app.set.service.SecretService", return_value=mock_secret_service_instance):
         with pytest.raises(ValueError, match="The secret is already revealed"):
-            set_service.play_set(base_data["set_id"], base_data["target_player_id"], base_data["secret_id"])
+            set_service.play_set(base_data["set_id"], None, base_data["target_player_id"], base_data["secret_id"])  # Agregado None como card_id
+
+
+# --- Tests para verify_cancellable_set ---
+
+def test_verify_cancellable_set_siblings_b_returns_false(db_session, monkeypatch):
+    """
+    Prueba que un set de tipo SIBLINGS_B devuelve False (no es cancelable).
+    """
+    set_id = uuid.uuid4()
+    
+    # Simula el set que devuelve el servicio
+    mock_set = SetModel(
+        id=set_id,
+        type=SetType.SIBLINGS_B
+    )
+    
+    # Mockea la llamada a SetService.get_set_by_id
+    mock_get = MagicMock(return_value=mock_set)
+    monkeypatch.setattr(SetService, "get_set_by_id", mock_get)
+
+    # Llama a la función y verifica
+    assert SetService.verify_cancellable_set(db_session, set_id) is False
+    mock_get.assert_called_once_with(db_session, set_id)
+
+
+def test_verify_cancellable_set_other_type_returns_true(db_session, monkeypatch):
+    """
+    Prueba que un set de cualquier otro tipo devuelve True (es cancelable).
+    """
+    set_id = uuid.uuid4()
+    
+    # Simula el set
+    mock_set = SetModel(
+        id=set_id,
+        type=SetType.PP
+    )
+    
+    # Mockea la llamada
+    mock_get = MagicMock(return_value=mock_set)
+    monkeypatch.setattr(SetService, "get_set_by_id", mock_get)
+
+    # Llama a la función y verifica
+    assert SetService.verify_cancellable_set(db_session, set_id) is True
+    mock_get.assert_called_once_with(db_session, set_id)
+
+
+def test_verify_cancellable_set_not_found_raises_exception(db_session, monkeypatch):
+    """
+    Prueba que se lanza SetNotFound si el set_id no existe.
+    """
+    set_id = uuid.uuid4()
+    
+    # Simula que el servicio no encuentra el set
+    mock_get = MagicMock(return_value=None)
+    monkeypatch.setattr(SetService, "get_set_by_id", mock_get)
+
+    # Llama a la función y verifica la excepción
+    with pytest.raises(SetNotFound):
+        SetService.verify_cancellable_set(db_session, set_id)
+    mock_get.assert_called_once_with(db_session, set_id)
+
+
+# --- Tests para verify_cancellable_new_set ---
+
+def test_verify_cancellable_new_set_only_siblings_returns_false(db_session, monkeypatch):
+    """
+    Prueba que un set nuevo con SOLO D_TB y D_TUB devuelve False.
+    """
+    # Simula las cartas (usando el DummyCard de tu archivo de test)
+    card1 = DummyCard(name="D_TB")
+    card2 = DummyCard(name="D_TUB")
+    
+    # Mockea la dependencia externa (CardService.get_card_by_id)
+    def fake_get_card(db, cid):
+        if cid == card1.id: return card1
+        if cid == card2.id: return card2
+        return None
+    
+    monkeypatch.setattr(CardService, "get_card_by_id", fake_get_card)
+
+    # Llama a la función y verifica
+    result = SetService.verify_cancellable_new_set(
+        db_session, [card1.id, card2.id]
+    )
+    assert result is False
+
+
+def test_verify_cancellable_new_set_mixed_cards_returns_true(db_session, monkeypatch):
+    """
+    Prueba que un set nuevo con D_TB, D_TUB y OTRA CARTA devuelve True.
+    """
+    # Simula las cartas
+    card1 = DummyCard(name="D_TB")
+    card2 = DummyCard(name="D_TUB")
+    card3 = DummyCard(name="D_PP")  
+    
+    # Mockea la dependencia
+    def fake_get_card(db, cid):
+        if cid == card1.id: return card1
+        if cid == card2.id: return card2
+        if cid == card3.id: return card3
+        return None
+    
+    monkeypatch.setattr(CardService, "get_card_by_id", fake_get_card)
+
+    # Llama a la función y verifica
+    result = SetService.verify_cancellable_new_set(
+        db_session, [card1.id, card2.id, card3.id]
+    )
+    assert result is True
+
+
+def test_verify_cancellable_new_set_only_other_cards_returns_true(db_session, monkeypatch):
+    """
+    Prueba que un set nuevo con SOLO otras cartas (ej. PP, MM) devuelve True.
+    """
+    # Simula las cartas
+    card1 = DummyCard(name="D_PP")
+    card2 = DummyCard(name="D_MM")
+    
+    # Mockea la dependencia
+    def fake_get_card(db, cid):
+        if cid == card1.id: return card1
+        if cid == card2.id: return card2
+        return None
+    
+    monkeypatch.setattr(CardService, "get_card_by_id", fake_get_card)
+
+    # Llama a la función y verifica
+    result = SetService.verify_cancellable_new_set(
+        db_session, [card1.id, card2.id]
+    )
+    assert result is True
+
+
+def test_verify_cancellable_new_set_card_not_found_raises_exception(db_session, monkeypatch):
+    """
+    Prueba que se lanza CardsNotFoundOrInvalidException si una carta no se encuentra.
+    """
+    card1_id = uuid.uuid4()
+    invalid_id = uuid.uuid4() # ID que no se encontrará
+
+    # Mockea la dependencia (solo encuentra la primera carta)
+    def fake_get_card(db, cid):
+        if cid == card1_id:
+            return DummyCard(name="D_TB")
+        return None  # Devuelve None para invalid_id
+    
+    monkeypatch.setattr(CardService, "get_card_by_id", fake_get_card)
+
+    # Llama a la función y verifica la excepción
+    with pytest.raises(CardsNotFoundOrInvalidException):
+        SetService.verify_cancellable_new_set(db_session, [card1_id, invalid_id])

@@ -157,3 +157,42 @@ class PlayEventBase(BaseModel):
     target_player: UUID | None = None
     secret_id: UUID | None = None
     set_id: UUID | None = None
+    requested_card_code: str | None = None
+    target_card_id: UUID | None = None
+    offered_card_id: UUID | None = None
+    direction: str | None = None
+
+class SelectPassingCardIn(BaseModel):
+    """
+    Body para PUT /cards/select_for_passing.
+    Representa la carta que un jugador elige pasar.
+    """
+    player_id: UUID
+    card_id: UUID
+
+
+class CardTradeSelectionIn(BaseModel):
+    """
+    Body para PUT /cards/play/E_CT/{game_id}/selection.
+    Representa la carta elegida por el jugador objetivo para el intercambio.
+    """
+    player_id: UUID
+    target_card_id: UUID
+    event_card_id: UUID
+
+
+class CardTradeResolutionOut(BaseModel):
+    offered_card: CardOut
+    received_card: CardOut
+
+class CardNoSoFastPlay(BaseModel):
+    player_id: UUID
+    card_id: UUID
+
+class VoteIn(BaseModel):
+    """
+    Body para PUT /cards/vote.
+    Representa el voto de un jugador hacia otro.
+    """
+    player_id: UUID
+    target_player_id: UUID 

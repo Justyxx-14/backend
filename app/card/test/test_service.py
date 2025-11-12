@@ -1,15 +1,19 @@
 import uuid
 import pytest
-from unittest.mock import MagicMock, patch, ANY
+from datetime import date
+from unittest.mock import MagicMock, patch, call, ANY
 from pydantic import ValidationError
-from sqlalchemy import func
+from sqlalchemy import func, create_engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 from fastapi import HTTPException
 from pydantic_core import ValidationError
+from app.db import Base
 
 from app.card.service import CardService
 from app.card import models, schemas
 from app.card.enums import CardOwner, CardType
+from app.card.models import Card
 from app.card.exceptions import (
     CardNotFoundException,
     CardIdMismatchException,
@@ -24,19 +28,70 @@ from app.card.exceptions import (
     ERR_GAME_NOT_FOUND,
     ERR_DB_COMMIT
 )
+
+from app.game.models import Game, GameTurnState
+from app.game.enums import TurnState
+from app.game.service import GameService
+from app.game.dtos import GameInDTO
 from app.set.exceptions import SetNotFound
+from app.secret.models import Secrets
 from app.secret.service import SecretService
+from app.player.models import Player
+from app.player.dtos import PlayerInDTO
+
+@pytest.fixture
+def db_session():
+    """Crea un mock de la sesión de base de datos."""
+    db = MagicMock()
+    # Configuración genérica de mock para que las queries no fallen
+    db.query.return_value.filter.return_value.first.return_value = None
+    return db
+
+
+def _build_card_trade_cards(game_id, player_id, target_player_id):
+    """Crea cartas válidas para los tests de Card Trade."""
+    event = MagicMock(spec=models.Card)
+    event.id = uuid.uuid4()
+    event.game_id = game_id
+    event.name = "E_CT"
+    event.owner = CardOwner.PLAYER
+    event.owner_player_id = player_id
+    event.description = "Card Trade"
+
+    offered = MagicMock(spec=models.Card)
+    offered.id = uuid.uuid4()
+    offered.game_id = game_id
+    offered.owner = CardOwner.PLAYER
+    offered.owner_player_id = player_id
+
+    target = MagicMock(spec=models.Card)
+    target.id = uuid.uuid4()
+    target.game_id = game_id
+    target.owner = CardOwner.PLAYER
+    target.owner_player_id = target_player_id
+
+    return event, offered, target
+
+
+def _patch_card_lookup(monkeypatch, lookup):
+    """Parcha CardService.get_card_by_id con un diccionario auxiliar."""
+    monkeypatch.setattr(
+        CardService,
+        "get_card_by_id",
+        staticmethod(lambda db_, cid: lookup.get(cid)),
+    )
 
 def make_db_mock() -> MagicMock:
-    """
-    Devuelve un 'Session' mockeado con la cadena query->filter->first/all y
-    add/add_all/commit/refresh. 
-    """
+    """Mock básico de la sesión de DB."""
     db = MagicMock()
     q = db.query.return_value
     f = q.filter.return_value
     f.first.return_value = None
     f.all.return_value = []
+    db.commit = MagicMock()
+    db.refresh = MagicMock()
+    db.rollback = MagicMock()
+    db.query.return_value.filter.return_value.scalar = MagicMock(return_value=0)
     return db
 
 #------------Create
@@ -708,12 +763,13 @@ def test_see_discard_pile_invalid_amount():
 
 
 # Helper
-def make_mock_card(name="E_LIA", owner=CardOwner.PLAYER, owner_player_id=None, id=None):
+def make_mock_card(name="E_LIA", owner=CardOwner.PLAYER, owner_player_id=None, id=None, game_id=None):
     c = MagicMock(spec=models.Card)
     c.id = id or uuid.uuid4()
     c.name = name
     c.owner = owner
     c.owner_player_id = owner_player_id
+    c.game_id = game_id
     return c
 
 def test_look_into_the_ashes_ok():
@@ -1166,3 +1222,978 @@ def test_another_victim_invalid_set_wrong_game(monkeypatch):
 
     with pytest.raises(SetNotFound):
         CardService.another_victim(db, game_id, player_id, uuid.uuid4(), uuid.uuid4())
+
+
+def test_card_trade_ok(monkeypatch):
+    """Intercambia cartas entre jugadores y descarta el evento."""
+    db = MagicMock()
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    target_player_id = uuid.uuid4()
+
+    event_card, offered_card, target_card = _build_card_trade_cards(
+        game_id, player_id, target_player_id
+    )
+
+    lookup = {
+        event_card.id: event_card,
+        offered_card.id: offered_card,
+        target_card.id: target_card,
+    }
+    _patch_card_lookup(monkeypatch, lookup)
+
+    moves: list[tuple[uuid.UUID, schemas.CardMoveIn]] = []
+
+    def fake_move_card(db_, cid, move_in):
+        moves.append((cid, move_in))
+        moved = MagicMock(spec=models.Card)
+        moved.id = cid
+        moved.owner = move_in.to_owner
+        moved.owner_player_id = move_in.player_id
+        return moved
+
+    monkeypatch.setattr(CardService, "move_card", staticmethod(fake_move_card))
+
+    # Happy path: swapping the cards updates both owners and discards the event.
+    result = CardService.card_trade(
+        db,
+        game_id,
+        player_id,
+        event_card.id,
+        target_player_id,
+        offered_card.id,
+        target_card.id,
+    )
+
+    assert isinstance(result, dict)
+    assert "discarded_card" in result
+    assert "blackmailed_events" in result
+
+    # 2. Saca la carta descartada del dict
+    discarded_card = result["discarded_card"]
+
+    # 3. Comprueba la carta descartada (como antes)
+    assert discarded_card.id == event_card.id
+    assert discarded_card.owner == CardOwner.DISCARD_PILE
+    
+    # 4. Comprueba que NO hubo eventos Blackmailed
+    assert result["blackmailed_events"] == []
+    assert len(moves) == 3
+
+    assert moves[0][0] == offered_card.id
+    assert moves[0][1].to_owner == CardOwner.PLAYER
+    assert moves[0][1].player_id == target_player_id
+
+    assert moves[1][0] == target_card.id
+    assert moves[1][1].to_owner == CardOwner.PLAYER
+    assert moves[1][1].player_id == player_id
+
+    assert moves[2][0] == event_card.id
+    assert moves[2][1].to_owner == CardOwner.DISCARD_PILE
+    assert moves[2][1].player_id is None
+
+
+@pytest.mark.parametrize("scenario", ["invalid_event", "invalid_offered", "invalid_target"])
+def test_card_trade_invalid_cases(monkeypatch, scenario):
+    """Fuerza los errores de validación para Card Trade."""
+    db = MagicMock()
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+    target_player = uuid.uuid4()
+
+    event_card, offered_card, target_card = _build_card_trade_cards(
+        game_id, player_id, target_player
+    )
+
+    if scenario == "invalid_offered":
+        offered_card.owner_player_id = uuid.uuid4()
+    else:  # invalid_target
+        target_card.owner_player_id = uuid.uuid4()
+
+    lookup = {
+        event_card.id: event_card,
+        offered_card.id: offered_card,
+        target_card.id: target_card,
+    }
+    _patch_card_lookup(monkeypatch, lookup)
+
+    with pytest.raises(CardsNotFoundOrInvalidException):
+        CardService.card_trade(
+            db,
+            game_id,
+            player_id,
+            event_card.id,
+            target_player,
+            offered_card.id,
+            target_card.id,
+        )
+
+def test_ensure_move_valid_not_in_disgrace(monkeypatch):
+    """Debe devolver True si el jugador no tiene social_disgrace"""
+    db = MagicMock()
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+
+    # Mock PlayerService
+    fake_player_service = MagicMock()
+    fake_player = MagicMock()
+    fake_player.social_disgrace = False
+    fake_player_service.get_player_entity_by_id.return_value = fake_player
+
+    monkeypatch.setattr("app.card.service.PlayerService", lambda db_: fake_player_service)
+
+    # Mock CardService.count_player_hand (no debería importar el valor)
+    monkeypatch.setattr(CardService, "count_player_hand", staticmethod(lambda db_, g, p: 3))
+
+    result = CardService.ensure_move_valid(db, game_id, player_id,1)
+    assert result is True
+
+
+def test_ensure_move_valid_in_disgrace_but_hand_equals_6(monkeypatch):
+    """Debe devolver True si el jugador tiene social_disgrace pero su mano es 6"""
+    db = MagicMock()
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+
+    fake_player_service = MagicMock()
+    fake_player = MagicMock()
+    fake_player.social_disgrace = True
+    fake_player_service.get_player_entity_by_id.return_value = fake_player
+
+    monkeypatch.setattr("app.card.service.PlayerService", lambda db_: fake_player_service)
+    monkeypatch.setattr(CardService, "count_player_hand", staticmethod(lambda db_, g, p: 6))
+
+    result = CardService.ensure_move_valid(db, game_id, player_id,1)
+    assert result is True
+
+
+def test_ensure_move_valid_in_disgrace_and_hand_not_6(monkeypatch):
+    """Debe devolver False si el jugador tiene social_disgrace y su mano NO es 6"""
+    db = MagicMock()
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+
+    fake_player_service = MagicMock()
+    fake_player = MagicMock()
+    fake_player.social_disgrace = True
+    fake_player_service.get_player_entity_by_id.return_value = fake_player
+
+    monkeypatch.setattr("app.card.service.PlayerService", lambda db_: fake_player_service)
+    monkeypatch.setattr(CardService, "count_player_hand", staticmethod(lambda db_, g, p: 4))
+
+    result = CardService.ensure_move_valid(db, game_id, player_id,1)
+    assert result is False
+
+def test_ensure_move_valid_in_disgrace_and_multiple_cards(monkeypatch):
+    """Debe devolver False si el jugador está en desgracia y n_cards > 1"""
+    db = MagicMock()
+    game_id = uuid.uuid4()
+    player_id = uuid.uuid4()
+
+    # Mock PlayerService
+    fake_player_service = MagicMock()
+    fake_player = MagicMock()
+    fake_player.social_disgrace = True
+    fake_player_service.get_player_entity_by_id.return_value = fake_player
+
+    # Inyectamos el mock
+    monkeypatch.setattr("app.card.service.PlayerService", lambda db_: fake_player_service)
+
+    # Simulamos una mano cualquiera (el valor no importa porque el filtro es por n_cards > 1)
+    monkeypatch.setattr(CardService, "count_player_hand", staticmethod(lambda db_, g, p: 4))
+
+    result = CardService.ensure_move_valid(db, game_id, player_id, n_cards=3)
+
+    assert result is False
+
+@pytest.fixture
+def dcf_service_data():
+    """
+    Fixture con datos para testear el servicio de Dead Card Folly (E_DCF).
+    Simula una partida de 3 jugadores (p1, p2, p3).
+    El jugador 'p1' es quien juega la carta.
+    """
+    db = make_db_mock()
+    game_id = uuid.uuid4()
+
+    p1_id, p2_id, p3_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    players_list = [p1_id, p2_id, p3_id]
+
+    event_card = make_mock_card(
+        name="E_DCF",
+        owner_player_id=p1_id,
+        id=uuid.uuid4(),
+        game_id=game_id
+    )
+
+    card_p1 = make_mock_card(name="Card P1", owner_player_id=p1_id, id=uuid.uuid4(), game_id=game_id)
+    card_p2 = make_mock_card(name="Card P2", owner_player_id=p2_id, id=uuid.uuid4(), game_id=game_id)
+    card_p3 = make_mock_card(name="Card P3", owner_player_id=p3_id, id=uuid.uuid4(), game_id=game_id)
+
+    cards_to_pass_map = {
+        p1_id: card_p1.id,
+        p2_id: card_p2.id,
+        p3_id: card_p3.id,
+    }
+
+    mock_game = MagicMock(spec=Game)
+    mock_game.players = [MagicMock(id=pid) for pid in players_list]
+
+    return {
+        "db": db,
+        "game_id": game_id,
+        "player_id": p1_id,
+        "event_card": event_card,
+        "cards_to_pass_map": cards_to_pass_map,
+        "player_cards": {p1_id: card_p1, p2_id: card_p2, p3_id: card_p3},
+        "mock_game": mock_game,
+        "players_list": players_list,
+    }
+
+def test_select_card_for_passing_ok(dcf_service_data):
+    """
+    Prueba que la carta seleccionada se mueva a PASSING
+    conservando el owner_player_id original.
+    """
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    p1 = dcf_service_data["player_id"]
+    card_p1 = dcf_service_data["player_cards"][p1]
+    card_p1.owner = CardOwner.PLAYER
+
+    mock_get_card = MagicMock(return_value=card_p1)
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    with patch("app.card.service.CardService.get_card_by_id", mock_get_card):
+        result = CardService.select_card_for_passing(db, game_id, p1, card_p1.id)
+
+    mock_get_card.assert_called_once_with(db, card_p1.id)
+    assert result == card_p1
+    assert card_p1.owner == CardOwner.PASSING
+    assert card_p1.owner_player_id == p1    
+    db.commit.assert_called_once()
+    db.refresh.assert_called_once_with(card_p1)
+
+def test_select_card_for_passing_raises_if_card_invalid(dcf_service_data):
+    """Falla si la carta no existe, no es del jugador o no está en juego."""
+    db = dcf_service_data["db"]
+    p1 = dcf_service_data["player_id"]
+    card_id = uuid.uuid4()
+
+    mock_get_card_none = MagicMock(return_value=None)
+    with patch("app.card.service.CardService.get_card_by_id", mock_get_card_none):
+        with pytest.raises(CardsNotFoundOrInvalidException):
+            CardService.select_card_for_passing(db, uuid.uuid4(), p1, card_id)
+
+    wrong_owner_card = make_mock_card(owner_player_id=uuid.uuid4(), owner=CardOwner.PLAYER)
+    mock_get_card_wrong_owner = MagicMock(return_value=wrong_owner_card)
+    with patch("app.card.service.CardService.get_card_by_id", mock_get_card_wrong_owner):
+        with pytest.raises(CardsNotFoundOrInvalidException):
+            CardService.select_card_for_passing(db, uuid.uuid4(), p1, card_id)
+
+    passing_card = make_mock_card(owner_player_id=p1, owner=CardOwner.PASSING)
+    mock_get_card_passing = MagicMock(return_value=passing_card)
+    with patch("app.card.service.CardService.get_card_by_id", mock_get_card_passing):
+        with pytest.raises(CardsNotFoundOrInvalidException):
+            CardService.select_card_for_passing(db, uuid.uuid4(), p1, card_id)
+
+def test_select_card_for_passing_raises_if_already_selected(dcf_service_data):
+    """Falla si el jugador ya tiene una carta en estado PASSING."""
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    p1 = dcf_service_data["player_id"]
+    card_p1 = dcf_service_data["player_cards"][p1]
+    card_p1.owner = CardOwner.PLAYER
+
+    mock_get_card = MagicMock(return_value=card_p1)
+    db.query.return_value.filter.return_value.first.return_value = make_mock_card()
+
+    with patch("app.card.service.CardService.get_card_by_id", mock_get_card):
+        with pytest.raises(HTTPException) as exc_info:
+            CardService.select_card_for_passing(db, game_id, p1, card_p1.id)
+        assert exc_info.value.status_code == 403
+
+# --- Tests para check_if_all_players_selected ---
+
+def test_check_if_all_players_selected_true(dcf_service_data):
+    """Devuelve True si el conteo de cartas PASSING == número de jugadores."""
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.players = [MagicMock(), MagicMock(), MagicMock()] 
+    n_players = len(mock_game_entity.players)
+
+    db.query.return_value.filter.return_value.scalar.return_value = n_players
+
+    result = CardService.check_if_all_players_selected(db, game_id, mock_game_entity)
+    assert result is True
+
+def test_check_if_all_players_selected_false(dcf_service_data):
+    """Devuelve False si el conteo de cartas PASSING != número de jugadores."""
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.players = [MagicMock(), MagicMock(), MagicMock()]
+
+    db.query.return_value.filter.return_value.scalar.return_value = 2
+
+    result = CardService.check_if_all_players_selected(db, game_id, mock_game_entity)
+    assert result is False
+
+def test_check_if_all_players_selected_false_zero_players(dcf_service_data):
+    """Devuelve False si no hay jugadores (caso borde)."""
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.players = []
+
+    db.query.return_value.filter.return_value.scalar.return_value = 0
+
+    result = CardService.check_if_all_players_selected(db, game_id, mock_game_entity)
+    assert result is False
+
+# --- Tests para execute_dead_card_folly_swap ---
+
+def test_execute_dead_card_folly_swap_ok_right(dcf_service_data):
+    """
+    Prueba el swap con dirección "right". Verifica movimientos y limpieza de estado.
+    """
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    event_card = dcf_service_data["event_card"]
+    p1, p2, p3 = dcf_service_data["players_list"]
+    card_p1 = dcf_service_data["player_cards"][p1]
+    card_p2 = dcf_service_data["player_cards"][p2]
+    card_p3 = dcf_service_data["player_cards"][p3]
+
+    card_p1.owner = CardOwner.PASSING
+    card_p2.owner = CardOwner.PASSING
+    card_p3.owner = CardOwner.PASSING
+    cards_in_passing = [card_p1, card_p2, card_p3]
+
+    mock_turn_state = MagicMock(spec=GameTurnState)
+    mock_turn_state.passing_direction = "right"
+    mock_turn_state.current_event_card_id = event_card.id
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.players = [MagicMock(id=pid) for pid in [p1, p2, p3]]
+    mock_game_entity.turn_state = mock_turn_state
+
+    db.query.return_value.filter.return_value.all.return_value = cards_in_passing
+
+    mock_game_service_instance = MagicMock()
+
+    mock_move_card_calls = []
+    def mock_move_card(db_arg, card_id_arg, move_in_arg):
+        mock_move_card_calls.append((card_id_arg, move_in_arg))
+        return make_mock_card(id=card_id_arg)
+
+    with patch("app.game.service.GameService", return_value=mock_game_service_instance) as mock_gs_class, \
+         patch("app.card.service.CardService.move_card", side_effect=mock_move_card) as mock_move:
+
+        result = CardService.execute_dead_card_folly_swap(db, game_id, mock_game_entity)
+
+    assert result == []
+    assert mock_move.call_count == 3
+
+    moves = {call[0]: call[1] for call in mock_move_card_calls}
+
+    players_list_unsorted = dcf_service_data["players_list"]
+    players_list_sorted = sorted(players_list_unsorted)
+
+    expected_recipients = {}
+    num_players = len(players_list_sorted)
+    for i in range(num_players):
+        sender_id = players_list_sorted[i]
+        recipient_id = players_list_sorted[(i + 1) % num_players]
+        expected_recipients[sender_id] = recipient_id
+    
+    assert moves[card_p1.id].to_owner == CardOwner.PLAYER
+    assert moves[card_p1.id].player_id == expected_recipients[p1]
+
+    assert moves[card_p2.id].to_owner == CardOwner.PLAYER
+    assert moves[card_p2.id].player_id == expected_recipients[p2]
+
+    assert moves[card_p3.id].to_owner == CardOwner.PLAYER
+    assert moves[card_p3.id].player_id == expected_recipients[p3]
+
+    mock_gs_class.assert_called_once_with(db)
+    mock_game_service_instance.change_turn_state.assert_called_once_with(
+        game_id, TurnState.DISCARDING 
+    )
+
+
+def test_execute_dead_card_folly_swap_handles_missing_state(dcf_service_data):
+    """Falla con HTTPException si game_entity.turn_state es None."""
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.turn_state = None 
+
+    with pytest.raises(HTTPException) as exc_info:
+        CardService.execute_dead_card_folly_swap(db, game_id, mock_game_entity)
+    assert exc_info.value.status_code == 500 
+
+
+@pytest.fixture
+def pys_service_setup():
+    """Crea mocks de Game, Players y TurnState para los tests de CardService."""
+    p1_id, p2_id, p3_id, p4_id = (uuid.uuid4() for _ in range(4))
+    players_list = [
+        MagicMock(spec=Player, id=p1_id),
+        MagicMock(spec=Player, id=p2_id),
+        MagicMock(spec=Player, id=p3_id),
+        MagicMock(spec=Player, id=p4_id),
+    ]
+    
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.players = players_list
+    mock_game_entity.current_turn = p1_id # p1 es el PYS player
+    
+    mock_turn_state = MagicMock(spec=GameTurnState)
+    mock_turn_state.current_event_card_id = uuid.uuid4()
+    mock_turn_state.vote_data = {} 
+    
+    mock_game_entity.turn_state = mock_turn_state
+    
+    return {
+        "db": MagicMock(spec=Session),
+        "game_id": uuid.uuid4(),
+        "game_entity": mock_game_entity,
+        "ids": {"p1": p1_id, "p2": p2_id, "p3": p3_id, "p4": p4_id}
+    }
+
+# --- Tests para check_if_all_players_voted ---
+
+def test_check_if_all_players_voted_false_empty(pys_service_setup):
+    """Devuelve False si vote_data está vacío."""
+    db = pys_service_setup["db"]
+    game_id = pys_service_setup["game_id"]
+    game_entity = pys_service_setup["game_entity"]
+    game_entity.turn_state.vote_data = {}
+    
+    result = CardService.check_if_all_players_voted(db, game_id, game_entity)
+    assert result is False
+
+def test_check_if_all_players_voted_false_partial(pys_service_setup):
+    """Devuelve False si faltan votos."""
+    db = pys_service_setup["db"]
+    game_id = pys_service_setup["game_id"]
+    game_entity = pys_service_setup["game_entity"]
+    ids = pys_service_setup["ids"]
+    
+    # 3 de 4 jugadores han votado
+    game_entity.turn_state.vote_data = {
+        str(ids["p1"]): str(ids["p2"]),
+        str(ids["p2"]): str(ids["p3"]),
+        str(ids["p3"]): str(ids["p2"]),
+    }
+    
+    result = CardService.check_if_all_players_voted(db, game_id, game_entity)
+    assert result is False
+
+def test_check_if_all_players_voted_true(pys_service_setup):
+    """Devuelve True si todos han votado."""
+    db = pys_service_setup["db"]
+    game_id = pys_service_setup["game_id"]
+    game_entity = pys_service_setup["game_entity"]
+    ids = pys_service_setup["ids"]
+    
+    # 4 de 4 jugadores han votado
+    game_entity.turn_state.vote_data = {
+        str(ids["p1"]): str(ids["p2"]),
+        str(ids["p2"]): str(ids["p3"]),
+        str(ids["p3"]): str(ids["p2"]),
+        str(ids["p4"]): str(ids["p2"]),
+    }
+    
+    result = CardService.check_if_all_players_voted(db, game_id, game_entity)
+    assert result is True
+
+# --- Tests para execute_pys_vote (Lógica de Conteo) ---
+
+@patch("app.game.service.GameService")
+@patch("app.card.service.CardService.move_card")
+@pytest.mark.asyncio
+async def test_execute_pys_vote_scenario_3_clear_winner(
+    mock_move_card, mock_game_service_class, pys_service_setup
+):
+    """(Escenario 3) A=3, B=1. Gana A (el más votado)."""
+    db = pys_service_setup["db"]
+    game_id = pys_service_setup["game_id"]
+    game_entity = pys_service_setup["game_entity"]
+    ids = pys_service_setup["ids"]
+    mock_game_service_instance = mock_game_service_class.return_value
+
+    # p1 (PYS) vota por p2. p2 vota por p2. p3 vota por p2. p4 vota por p3.
+    # Resultado: p2=3 votos, p3=1 voto. Ganador: p2.
+    game_entity.current_turn = ids["p1"] # p1 es el PYS player
+    game_entity.turn_state.vote_data = {
+        str(ids["p1"]): str(ids["p2"]),
+        str(ids["p2"]): str(ids["p2"]),
+        str(ids["p3"]): str(ids["p2"]),
+        str(ids["p4"]): str(ids["p3"]),
+    }
+    
+    winner_id = await CardService.execute_pys_vote(db, game_id, game_entity)
+    
+    assert winner_id == ids["p2"] # p2 fue el más votado
+    
+    # Verificar que se cambió al estado correcto, apuntando al ganador
+    mock_game_service_instance.change_turn_state.assert_called_once_with(
+        game_id, 
+        TurnState.CHOOSING_SECRET_PYS,
+        target_player_id=ids["p2"]
+    )
+
+@patch("app.game.service.GameService")
+@patch("app.card.service.CardService.move_card")
+@pytest.mark.asyncio
+async def test_execute_pys_vote_scenario_2_tie_pys_breaks_tie(
+    mock_move_card, mock_game_service_class, pys_service_setup
+):
+    """(Escenario 2) A=2 (PYS), B=2. Gana A (votado por PYS)."""
+    db = pys_service_setup["db"]
+    game_id = pys_service_setup["game_id"]
+    game_entity = pys_service_setup["game_entity"]
+    ids = pys_service_setup["ids"]
+    mock_game_service_instance = mock_game_service_class.return_value
+
+    # p1 (PYS) vota por p2. p2 vota por p2. p3 vota por p3. p4 vota por p3.
+    # Resultado: p2=2 votos (PYS votó aquí), p3=2 votos.
+    # Empate: [p2, p3].
+    # Voto PYS: p2.
+    # Ganador: p2.
+    game_entity.current_turn = ids["p1"] # p1 es el PYS player
+    game_entity.turn_state.vote_data = {
+        str(ids["p1"]): str(ids["p2"]),
+        str(ids["p2"]): str(ids["p2"]),
+        str(ids["p3"]): str(ids["p3"]),
+        str(ids["p4"]): str(ids["p3"]),
+    }
+    
+    winner_id = await CardService.execute_pys_vote(db, game_id, game_entity)
+    
+    assert winner_id == ids["p2"] # p2 gana por el voto PYS
+    mock_game_service_instance.change_turn_state.assert_called_once_with(
+        game_id, 
+        TurnState.CHOOSING_SECRET_PYS,
+        target_player_id=ids["p2"]
+    )
+
+@patch("app.game.service.GameService")
+@patch("app.card.service.CardService.move_card")
+@pytest.mark.asyncio
+async def test_execute_pys_vote_scenario_1_tie_pys_decides_other(
+    mock_move_card, mock_game_service_class, pys_service_setup
+):
+    """(Escenario 1) A=2, B=2, C=1 (PYS). Gana C (votado por PYS)."""
+    db = pys_service_setup["db"]
+    game_id = pys_service_setup["game_id"]
+    game_entity = pys_service_setup["game_entity"]
+    ids = pys_service_setup["ids"]
+    mock_game_service_instance = mock_game_service_class.return_value
+
+    # p1 (PYS) vota por p4. p2 vota por p2. p3 vota por p2. p4 vota por p3. p5 (agregado) vota por p3.
+    # Necesitamos 5 jugadores para este escenario
+    p5_id = uuid.uuid4()
+    game_entity.players.append(MagicMock(spec=Player, id=p5_id))
+    
+    # Resultado: p2=2 votos, p3=2 votos, p4=1 voto (PYS votó aquí).
+    # Empate: [p2, p3].
+    # Voto PYS: p4.
+    # Ganador: p4.
+    game_entity.current_turn = ids["p1"] # p1 es el PYS player
+    game_entity.turn_state.vote_data = {
+        str(ids["p1"]): str(ids["p4"]),
+        str(ids["p2"]): str(ids["p2"]),
+        str(ids["p3"]): str(ids["p2"]),
+        str(ids["p4"]): str(ids["p3"]),
+        str(p5_id): str(ids["p3"]),
+    }
+    
+    winner_id = await CardService.execute_pys_vote(db, game_id, game_entity)
+    
+    assert winner_id == ids["p4"] # p4 gana por el voto PYS
+    mock_game_service_instance.change_turn_state.assert_called_once_with(
+        game_id, 
+        TurnState.CHOOSING_SECRET_PYS,
+        target_player_id=ids["p4"]
+    )
+    
+# --- Tests para verify_cancellable_card ---
+
+@pytest.mark.parametrize("cancellable_name", [
+    "E_PYS",
+    "E_CT",
+    "E_AV",
+    "D_TB", # Cartas de detective (default)
+])
+def test_verify_cancellable_card_returns_true(
+    db_session, monkeypatch, cancellable_name
+):
+    """
+    Prueba que una carta que SÍ es cancelable (no está en la lista de exclusión)
+    devuelve True.
+    """
+    card_id = uuid.uuid4()
+    
+    # 1. Simula la carta que SÍ es cancelable
+    mock_card = MagicMock(spec=models.Card)
+    mock_card.id = card_id
+    mock_card.name = cancellable_name
+    
+    # 2. Mockea la dependencia
+    mock_get = MagicMock(return_value=mock_card)
+    monkeypatch.setattr(CardService, "get_card_by_id", mock_get)
+
+    # 3. Llama y verifica
+    assert CardService.verify_cancellable_card(db_session, card_id) is True
+    mock_get.assert_called_once_with(db_session, card_id)
+
+
+@pytest.mark.parametrize("non_cancellable_name", ["E_COT", "DV_BLM"])
+def test_verify_cancellable_card_returns_false_for_non_cancellable(
+    db_session, monkeypatch, non_cancellable_name
+):
+    """
+    Prueba que las cartas 'E_COT' y 'DV_BLM' devuelven False (no son cancelables).
+    """
+    card_id = uuid.uuid4()
+    
+    # 1. Simula la carta NO cancelable
+    mock_card = MagicMock(spec=models.Card)
+    mock_card.id = card_id
+    mock_card.name = non_cancellable_name  # Usa el parámetro del test
+    
+    # 2. Mockea la dependencia
+    mock_get = MagicMock(return_value=mock_card)
+    monkeypatch.setattr(CardService, "get_card_by_id", mock_get)
+
+    # 3. Llama y verifica
+    assert CardService.verify_cancellable_card(db_session, card_id) is False
+    mock_get.assert_called_once_with(db_session, card_id)
+
+
+def test_verify_cancellable_card_not_found_raises_exception(db_session, monkeypatch):
+    """
+    Prueba que se lanza CardsNotFoundOrInvalidException si la carta no se encuentra.
+    """
+    card_id = uuid.uuid4()
+    
+    # 1. Simula que get_card_by_id devuelve None
+    mock_get = MagicMock(return_value=None)
+    monkeypatch.setattr(CardService, "get_card_by_id", mock_get)
+
+    # 2. Llama y verifica la excepción
+    with pytest.raises(CardsNotFoundOrInvalidException, match=f"Card {card_id} not found"):
+        CardService.verify_cancellable_card(db_session, card_id)
+    
+    mock_get.assert_called_once_with(db_session, card_id)
+
+@patch("app.game.service.GameService")
+@patch("app.card.service.CardService.move_card")
+def test_execute_dcf_swap_triggers_blackmailed(
+    mock_move_card, mock_game_service_class
+):
+    """
+    Prueba que si se pasa DV_BLM, se genera un 'blackmailed_event'
+    con los secretos NO revelados.
+    """
+    db = MagicMock(spec=Session)
+    game_id = uuid.uuid4()
+    
+    p1_id = uuid.uuid4()
+    p2_id = uuid.uuid4()
+    players_list_sorted = sorted([p1_id, p2_id])
+
+    sender_id = players_list_sorted[0]
+    recipient_id = players_list_sorted[1]
+
+    card_p1 = MagicMock(spec=models.Card)
+    card_p1.id = uuid.uuid4()
+    card_p1.name = "DV_BLM" 
+    card_p1.owner_player_id = sender_id
+    cards_in_passing = [card_p1] 
+
+    mock_secret_hidden = MagicMock(spec=Secrets, id=uuid.uuid4(), name="Oculto")
+    
+    mock_turn_state = MagicMock(spec=GameTurnState)
+    mock_turn_state.passing_direction = "right" # p1 pasa a p2
+    mock_game_entity = MagicMock(spec=Game)
+    mock_game_entity.players = [MagicMock(id=pid) for pid in players_list_sorted]
+    mock_game_entity.turn_state = mock_turn_state
+
+    
+    mock_query_cards = MagicMock()
+    mock_query_cards.filter.return_value.all.return_value = cards_in_passing
+
+    mock_query_secrets = MagicMock()
+    mock_query_secrets.filter.return_value.all.return_value = [mock_secret_hidden]
+
+    db.query.side_effect = [
+        mock_query_cards,  
+        mock_query_secrets
+    ]
+    
+    result_events = CardService.execute_dead_card_folly_swap(db, game_id, mock_game_entity)
+
+    assert len(result_events) == 1, "Debería haberse generado 1 evento Blackmailed"
+    
+    event_data = result_events[0]
+    assert event_data["actor_player_id"] == str(sender_id)
+    assert event_data["target_player_id"] == str(recipient_id)
+
+    secret_list = event_data["available_secrets"]
+    assert len(secret_list) == 1
+    assert secret_list[0]["id"] == str(mock_secret_hidden.id)
+
+    assert mock_move_card.call_count == 1
+    
+    mock_game_service_class.return_value.change_turn_state.assert_called_once_with(
+        game_id, TurnState.DISCARDING 
+    )
+    
+@pytest.mark.asyncio
+async def test_wait_for_cancellation_timeout(monkeypatch):
+    """Debe salir sin errores cuando no cambia nada y se cumple el timeout"""
+    fake_db = MagicMock()
+    fake_game = MagicMock()
+    fake_game.turn_state.state = TurnState.CANCELLED_CARD_PENDING
+    fake_game.turn_state.is_canceled_card = False
+    fake_game.turn_state.last_is_canceled_card = False
+    fake_db.query().filter_by().first.return_value = fake_game
+
+    # Reducimos el timeout para no demorar
+    result = await CardService.wait_for_cancellation(fake_db, uuid.uuid4(), timeout=0.5)
+
+    assert result is None
+    fake_db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cancellation_game_not_found():
+    """Debe lanzar HTTP 404 si el juego no existe"""
+    fake_db = MagicMock()
+    fake_db.query().filter_by().first.return_value = None
+
+    with pytest.raises(HTTPException) as exc:
+        await CardService.wait_for_cancellation(fake_db, uuid.uuid4(), timeout=0.1)
+
+    assert exc.value.status_code == 404
+    assert "Game" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_wait_for_cancellation_invalid_state():
+    """Debe lanzar HTTP 404 si el estado no es CANCELLED_CARD_PENDING"""
+    fake_db = MagicMock()
+    fake_game = MagicMock()
+    fake_game.turn_state.state = "OTHER_STATE"
+    fake_db.query().filter_by().first.return_value = fake_game
+
+    with pytest.raises(HTTPException) as exc:
+        await CardService.wait_for_cancellation(fake_db, uuid.uuid4(), timeout=0.1)
+
+    assert exc.value.status_code == 404
+
+@patch("app.game.service.GameService") # Mockeamos la CLASE GameService
+@patch("app.card.service.CardService.move_card")
+def test_execute_dcf_swap_triggers_sfp_only(
+    mock_move_card, mock_game_service_class, dcf_service_data
+):
+    """
+    Prueba que si se pasa SÓLO una DV_SFP (y no una BLM):
+    1. El 'result_events' (de Blackmailed) está vacío.
+    2. El estado del juego cambia a PENDING_DEVIOUS (y NO a DISCARDING).
+    """
+    # 1. ARRANGE
+    db = dcf_service_data["db"]
+    game_id = dcf_service_data["game_id"]
+    game_entity = dcf_service_data["mock_game"]
+    
+    players_list_sorted = sorted(dcf_service_data["players_list"])
+    p1, p2, p3 = players_list_sorted
+    
+    card_p1 = dcf_service_data["player_cards"][p1]
+    card_p2 = dcf_service_data["player_cards"][p2]
+    card_p3 = dcf_service_data["player_cards"][p3]
+
+    # --- Configuración del Test ---
+    card_p1.name = "Normal Card 1"
+    card_p1.owner = CardOwner.PASSING
+    card_p2.name = "DV_SFP" # <-- ¡La carta clave!
+    card_p2.owner = CardOwner.PASSING
+    card_p3.name = "Normal Card 2"
+    card_p3.owner = CardOwner.PASSING
+    cards_in_passing = [card_p1, card_p2, card_p3]
+
+    # Configurar Mocks de Game/State (dirección 'right')
+    game_entity.turn_state.passing_direction = "right" # p2 pasa SFP a p3
+    game_entity.players = [MagicMock(id=pid) for pid in players_list_sorted]
+    
+    # --- Mock de Consultas a la DB ---
+    # (Solo necesitamos mockear la consulta de 'cards')
+    mock_query_cards = MagicMock()
+    mock_query_cards.filter.return_value.all.return_value = cards_in_passing
+    
+    # (No necesitamos mockear 'Secrets', porque _create_blackmailed_event no se llamará)
+
+    def query_side_effect(model_class_arg):
+        if model_class_arg.__tablename__ == "cards":
+            return mock_query_cards
+        # Si (por error) consulta Secrets, devolverá un mock vacío
+        return MagicMock(filter=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))) 
+    
+    db.query.side_effect = query_side_effect
+    # --- Fin Mocks DB ---
+    
+    # Obtenemos la instancia mockeada del GameService
+    mock_game_service_instance = mock_game_service_class.return_value
+
+    # 2. ACT
+    result_events = CardService.execute_dead_card_folly_swap(db, game_id, game_entity)
+
+    # 3. ASSERT
+    
+    # A. Verificar el resultado (No debe haber eventos de Blackmailed)
+    assert result_events == [], "No deberían generarse eventos de Blackmailed"
+    
+    # B. Verificar que el swap de las 3 cartas ocurrió
+    assert mock_move_card.call_count == 3
+    assert mock_game_service_instance.change_turn_state.call_count == 2 # Aceptar las 2 llamadas
+
+    # Verificar que la llamada que nos importa SÍ ocurrió
+    expected_call = call(
+        game_id,
+        TurnState.PENDING_DEVIOUS,
+        target_player_id=p3
+    )
+    mock_game_service_instance.change_turn_state.assert_has_calls([expected_call])
+
+def test_card_trade_detects_sfp_A_to_B(monkeypatch):
+    """Prueba que card_trade detecta SFP si A se la da a B."""
+    # 1. Arrange
+    db = MagicMock(spec=Session)
+    game_id, p1_id, p2_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    event_card_id, card_A_id, card_B_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    card_A = make_mock_card(
+        id=card_A_id, 
+        name="DV_SFP", 
+        owner_player_id=p1_id,
+        game_id=game_id, 
+        owner=CardOwner.PLAYER 
+    )
+    card_B = make_mock_card(
+        id=card_B_id, 
+        name="Normal", 
+        owner_player_id=p2_id,
+        game_id=game_id, 
+        owner=CardOwner.PLAYER
+    )
+
+    # Mock de GameService
+    mock_game_service = MagicMock(spec=GameService)
+    monkeypatch.setattr("app.game.service.GameService", lambda db: mock_game_service)
+    
+    # Mock de get_card_by_id
+    def get_card_side_effect(db_arg, card_id_arg):
+        if card_id_arg == card_A_id: return card_A
+        if card_id_arg == card_B_id: return card_B
+        return make_mock_card() # Mock genérico para la event_card
+    
+    monkeypatch.setattr(CardService, "get_card_by_id", get_card_side_effect)
+    monkeypatch.setattr(CardService, "move_card", lambda db, cid, move: make_mock_card(id=cid))
+
+    # 2. Act
+    result_dict = CardService.card_trade(
+        db, game_id, p1_id, event_card_id, p2_id, card_A_id, card_B_id
+    )
+
+    # 3. Assert
+    assert result_dict["blackmailed_events"] == [] # No hubo BLM
+    # Verificar que se llamó a change_turn_state para SFP
+    mock_game_service.change_turn_state.assert_called_once_with(
+        game_id,
+        TurnState.PENDING_DEVIOUS,
+        target_player_id=p2_id # B (receptor) debe actuar
+    )
+
+# --- Test para check_players_SFP ---
+# (Esta fixture es la de game_service, la necesitamos aquí)
+
+@pytest.fixture(scope="function")
+def db_session2():
+    """
+    Crea una DB en memoria limpia para cada test en ESTE archivo.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    
+    # Crea TODAS las tablas que tus modelos conocen
+    Base.metadata.create_all(bind=engine)
+    
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    yield session
+    session.close()
+    Base.metadata.drop_all(bind=engine)
+
+@pytest.fixture(scope="function")
+def game_service(db_session2: Session): # <-- Añade el tipo para claridad
+    """Crea una instancia de GameService con la DB de test."""
+    return GameService(db_session2)
+
+@pytest.fixture
+def game_with_state(game_service: GameService, db_session2: Session):
+    """
+    Crea un juego, p1, p2, y un GameTurnState con 'sfp_players' inicializado.
+    (El nombre de esta fixture ahora es el que tus tests usan)
+    """
+    dto = GameInDTO(
+        name="Test Game SFP",
+        host_name="Player 1",
+        birthday=date(2000,1,1),
+        min_players=2,
+        max_players=4
+    )
+    game_dto = game_service.create_game(dto)
+    p2_id = game_service.add_player(game_dto.id, PlayerInDTO(name="Player 2", birthday=date(2001,1,1)))
+    
+    game = db_session2.query(Game).filter(Game.id == game_dto.id).first()
+    
+    # Crea el estado inicial
+    turn_state = GameTurnState(
+        game_id=game.id,
+        state=TurnState.IDLE,
+        sfp_players=[] # Inicializa la lista vacía
+    )
+    db_session2.add(turn_state)
+    game.turn_state = turn_state
+    db_session2.commit()
+    db_session2.refresh(turn_state)
+    
+    return {
+        "game_service": game_service,
+        "db": db_session2,
+        "game_id": game.id,
+        "p1_id": game.host_id,
+        "p2_id": p2_id,
+        "turn_state_obj": turn_state
+    }
+
+def test_check_players_sfp_fails_if_player_not_in_list(game_with_state):
+    """
+    Prueba que falla si el jugador que intenta resolver no está en la lista.
+    """
+    db = game_with_state["db"]
+    game_id = game_with_state["game_id"]
+    p1_id = game_with_state["p1_id"]
+    p2_id = game_with_state["p2_id"]
+    turn_state_obj = game_with_state["turn_state_obj"]
+    
+    turn_state_obj.sfp_players = [str(p2_id)] # Solo p2 está en la lista
+    db.commit()
+
+    # p1 intenta resolver
+    with pytest.raises(HTTPException, match="El jugador no estaba pendiente"):
+        CardService.check_players_SFP(db, game_id, p1_id)

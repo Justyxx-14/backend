@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.card import schemas
 from app.card.models import Card, CardOwner
+from app.game.enums import TurnState
 
 client = TestClient(app)
 
@@ -80,17 +81,19 @@ def test_pick_draft_card_success(mock_card):
     payload = {
         "player_id": str(player_id),
         "card_id": str(mock_card.id),
-        "to_owner": "PLAYER"
     }
 
     fake_game = MagicMock(id=game_id, players_ids=[player_id])
+    fake_player = MagicMock(social_disgrace=False)
 
     with (
         patch("app.card.endpoints.GameService") as mock_game_service,
-        patch("app.card.endpoints.CardService.pick_draft", return_value=(mock_card, False))
+        patch("app.card.endpoints.CardService.pick_draft", return_value=(mock_card, False)),
+        patch("app.card.endpoints.PlayerService") as mock_player_service
     ):
         mock_game_service.return_value.get_game_by_id.return_value = fake_game
         mock_game_service.return_value.get_turn.return_value = player_id
+        mock_player_service.return_value.get_player_entity_by_id.return_value = fake_player
         response = client.put(f"/cards/draft/{game_id}", json=payload)
 
     assert response.status_code == 200
@@ -108,17 +111,19 @@ def test_pick_draft_card_not_found(mock_card):
     payload = {
         "player_id": str(player_id),
         "card_id": str(mock_card.id),
-        "to_owner": "PLAYER"
     }
 
     fake_game = MagicMock(id=game_id, players_ids=[player_id])
+    fake_player = MagicMock(social_disgrace=False)
 
     with (
         patch("app.card.endpoints.GameService") as mock_game_service,
-        patch("app.card.endpoints.CardService.pick_draft", side_effect=NoCardsException(game_id))
+        patch("app.card.endpoints.CardService.pick_draft", side_effect=NoCardsException(game_id)),
+        patch("app.card.endpoints.PlayerService") as mock_player_service
     ):
         mock_game_service.return_value.get_game_by_id.return_value = fake_game
         mock_game_service.return_value.get_turn.return_value = player_id
+        mock_player_service.return_value.get_player_entity_by_id.return_value = fake_player
         response = client.put(f"/cards/draft/{game_id}", json=payload)
 
     assert response.status_code == 404
@@ -131,8 +136,7 @@ def test_pick_draft_card_player_not_in_game(mock_card):
 
     payload = {
         "player_id": str(player_id),
-        "card_id": str(mock_card.id),
-        "to_owner": "PLAYER"
+        "card_id": str(mock_card.id)
     }
 
     fake_game = MagicMock(id=game_id, players_ids=[])
@@ -143,3 +147,50 @@ def test_pick_draft_card_player_not_in_game(mock_card):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "GameNotFoundOrPlayerNotInGame"
+
+def test_pick_draft_invalid_turn_state(mock_card):
+    """ Debe devolver 400 si el estado de la partida no permite esta accion"""
+    player_id = uuid4()
+    game_id = mock_card.game_id
+
+    payload = {
+        "player_id": str(player_id),
+        "card_id": str(mock_card.id),
+        "to_owner": "PLAYER"
+    }
+
+    fake_game = MagicMock(id=game_id, players_ids=[player_id])
+    fake_game_turn_state = MagicMock(turn_state = TurnState.END_TURN)
+
+    with (patch("app.card.endpoints.GameService") as mock_game_service):
+        mock_game_service.return_value.get_game_by_id.return_value = fake_game
+        mock_game_service.return_value.get_turn.return_value = player_id
+        mock_game_service.return_value.get_turn_state.return_value = fake_game_turn_state
+        response = client.put(f"/cards/draft/{game_id}", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid accion for the game state"
+def test_pick_draft_card_player_social_disgrace(mock_card):
+    """Debe devolver 403 si el jugador esta en desgracia social"""
+    player_id = uuid4()
+    game_id = mock_card.game_id
+    payload={
+        "player_id": str(player_id),
+        "card_id": str(mock_card.id),
+    }
+
+    fake_game = MagicMock(id=game_id, players_ids=[player_id])
+    fake_player = MagicMock(social_disgrace=True)
+
+    with (
+        patch("app.card.endpoints.GameService") as mock_game_service,
+        patch("app.card.endpoints.CardService.pick_draft", return_value=mock_card),
+        patch("app.card.endpoints.PlayerService") as mock_player_service
+    ):
+        mock_game_service.return_value.get_game_by_id.return_value = fake_game
+        mock_game_service.return_value.get_turn.return_value = player_id
+        mock_player_service.return_value.get_player_entity_by_id.return_value = fake_player
+        response = client.put(f"/cards/draft/{game_id}", json=payload)
+    
+    assert response.status_code == 403
+    assert response.json()["detail"] == "No se puede levantar del draft estando en Desgracia social"

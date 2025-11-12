@@ -1,24 +1,30 @@
 from datetime import date
 from typing import List, Optional, Union
 from uuid import UUID
+from fastapi import HTTPException
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
+from sqlalchemy.orm.attributes import flag_modified
 from pathlib import Path
 import json
+from fastapi.encoders import jsonable_encoder
 
 from app.game.models import Game
+from app.game.models import GameTurnState
 from app.game.dtos import GameInDTO, GameOutDTO
-from app.game.schemas import EndGameResult, PlayerSummary, PlayerRoleInfo
-from app.game.enums import GameEndReason, WinningTeam, PlayerRole
+from app.game.schemas import EndGameResult, PlayerSummary, PlayerRoleInfo, GameTurnStateOut
+from app.game.enums import GameEndReason, WinningTeam, PlayerRole, TurnState
 from app.player.service import PlayerService
 from app.player.dtos import PlayerInDTO
 from app.player.models import Player
 from app.card.enums import CardOwner
-from app.card.schemas import CardIn, CardBatchIn
+from app.card.schemas import CardIn, CardBatchIn, CardMoveIn
 from app.card.service import CardService
 from app.secret.service import SecretService
 from app.secret.models import Secrets
 from app.secret.enums import SecretType
+from app.websocket.connection_man import manager
+from app.game.turn_timer import turn_timer_manager
 
 
 
@@ -44,6 +50,7 @@ class GameService:
             GameOutDTO(
                 id=g.id,
                 name=g.name,
+                password= g.password,
                 host_id=g.host_id,
                 min_players=g.min_players,
                 max_players=g.max_players,
@@ -60,12 +67,37 @@ class GameService:
         return GameOutDTO(
             id=game.id,
             name=game.name,
+            password=game.password,
             host_id=game.host_id,
             min_players=game.min_players,
             max_players=game.max_players,
             ready=game.ready,
             players_ids=[p.id for p in game.players],
         )
+    
+    def get_game_entity_by_id(self, game_id: UUID) -> Optional[Game]:
+        """
+        Devuelve la entidad (el modelo SQLAlchemy) completa de Game,
+        incluyendo la relación 'turn_state' precargada.
+        """
+        game = (
+            self.db.query(Game)
+            .options(joinedload(Game.turn_state))
+            .filter(Game.id == game_id)
+            .first()
+        )
+        return game
+
+    def get_turn_state_entity(self, game_id: UUID) -> Optional[GameTurnState]:
+        """
+        Devuelve la entidad (modelo SQLAlchemy) GameTurnState para un juego.
+        """
+        state = (
+            self.db.query(GameTurnState)
+            .filter(GameTurnState.game_id == game_id)
+            .first()
+        )
+        return state
 
     def create_game(self, game_data: GameInDTO) -> GameOutDTO:
         player_service = PlayerService(self.db)
@@ -74,6 +106,7 @@ class GameService:
 
         new_game = Game(
             name=game_data.name,
+            password=game_data.password,
             host_id=host.id,
             min_players=game_data.min_players,
             max_players=game_data.max_players,
@@ -94,6 +127,7 @@ class GameService:
         return GameOutDTO(
             id=new_game.id,
             name=new_game.name,
+            password=new_game.password,
             host_id=host.id,
             min_players=new_game.min_players,
             max_players=new_game.max_players,
@@ -157,6 +191,14 @@ class GameService:
             if player.id == current_player_id:
                 next_idx = (idx + 1) % len(players)
                 game.current_turn = players[next_idx].id
+                if game.turn_state:
+                    game.turn_state.state = TurnState.IDLE
+                else:
+                    # Si no existe, lo creamos
+                    game.turn_state = GameTurnState(
+                        game_id=game.id,
+                        state=TurnState.IDLE
+                    )
                 self.db.commit()
                 return players[next_idx].id
 
@@ -176,8 +218,12 @@ class GameService:
 
         # Usar deck_json pasado como parámetro o leer desde archivo
         if deck_json is None:
-            deck_path = Path(__file__).parent.parent / "card" / "deck.json"
-            with deck_path.open("r", encoding="utf-8") as f:
+            if len(game.players) == 2:
+                deck_path = Path(__file__).parent.parent / "card" / "deck2p.json"
+            else:
+                deck_path = Path(__file__).parent.parent / "card" / "deck.json"
+            
+            with deck_path.open("r", encoding="utf-8") as f:    
                 deck_json = json.load(f)
 
         assert deck_json is not None
@@ -211,7 +257,11 @@ class GameService:
 
         # Inicializar y repartir los secretos
         SecretService.create_secrets(self.db, game.id, jugadores_ids)
-        SecretService.deal_secrets(self.db, game.id, jugadores_ids)        
+        SecretService.deal_secrets(self.db, game.id, jugadores_ids)   
+        game.turn_state = GameTurnState(
+            game_id=game.id,
+            state=TurnState.IDLE
+        )
         
         self.db.commit()
         return True
@@ -309,3 +359,281 @@ class GameService:
         )
 
         return result_dto
+    
+    def get_turn_state(self, game_id: UUID) -> GameTurnStateOut:
+        turn_state = (
+            self.db.query(GameTurnState)
+            .filter(GameTurnState.game_id == game_id)
+            .first()
+        )
+        if not turn_state:
+            raise ValueError("No existe estado de turno para este juego")
+
+        return GameTurnStateOut(
+            turn_state=turn_state.state,
+            target_player_id=turn_state.target_player_id,
+            current_event_card_id=turn_state.current_event_card_id,
+            card_trade_offered_card_id=turn_state.card_trade_offered_card_id,
+            passing_direction=turn_state.passing_direction,
+            is_cancelled=turn_state.is_canceled_card,
+            last_is_canceled_card=turn_state.last_is_canceled_card,
+            vote_data=turn_state.vote_data,
+            sfp_players=[str(p) for p in turn_state.sfp_players] if turn_state.sfp_players else None
+        )
+    
+    def change_turn_state(
+            self, 
+            game_id: UUID, 
+            new_state: TurnState, 
+            target_player_id: UUID | None = None,
+            passing_direction: str | None = None,
+            current_event_card_id: UUID | None = None,
+            card_trade_offered_card_id: UUID | None = None,
+            is_cancelled: bool | None = None
+    ):
+
+        game_obj = self.db.query(Game).filter(Game.id == game_id).first()
+        if not game_obj: 
+            raise ValueError("Juego no encontrado")
+        if not game_obj.turn_state:
+            raise ValueError("Estado de la partida no encontrado")
+        
+        game_obj.turn_state.state = new_state
+
+        if new_state in {
+            TurnState.CHOOSING_SECRET, 
+            TurnState.CHOOSING_SECRET_PYS,
+            TurnState.CARD_TRADE_PENDING
+        }:
+            if not target_player_id:
+                raise ValueError("Se requiere target_played_id")
+            game_obj.turn_state.target_player_id = target_player_id
+        else :
+            game_obj.turn_state.target_player_id = None
+
+        if new_state == TurnState.PASSING_CARDS:
+            # Si entramos en este estado, exigimos los nuevos campos
+            if not passing_direction or not current_event_card_id:
+                raise ValueError("Se requieren passing_direction y current_event_card_id para este estado")
+            game_obj.turn_state.passing_direction = passing_direction
+            game_obj.turn_state.current_event_card_id = current_event_card_id
+            game_obj.turn_state.card_trade_offered_card_id = None
+            game_obj.turn_state.vote_data = None
+
+        elif new_state == TurnState.CARD_TRADE_PENDING:
+            required_fields = [
+                current_event_card_id,
+                card_trade_offered_card_id,
+            ]
+            if any(value is None for value in required_fields):
+                raise ValueError("Se requieren datos de Card Trade para este estado")
+            game_obj.turn_state.passing_direction = None
+            game_obj.turn_state.current_event_card_id = current_event_card_id
+            game_obj.turn_state.card_trade_offered_card_id = card_trade_offered_card_id
+
+        elif new_state == TurnState.CANCELLED_CARD_PENDING:
+            if is_cancelled == None:
+                raise ValueError("Se requiere is_cancelled")
+            game_obj.turn_state.is_canceled_card = is_cancelled
+            if game_obj.turn_state.last_is_canceled_card == None:
+                game_obj.turn_state.last_is_canceled_card = is_cancelled
+
+        elif new_state == TurnState.VOTING:
+            game_obj.turn_state.vote_data = {} 
+
+            if not current_event_card_id:
+                 raise ValueError("Se requiere current_event_card_id para el estado VOTING")
+            game_obj.turn_state.current_event_card_id = current_event_card_id
+        
+        elif new_state == TurnState.PENDING_DEVIOUS:
+            if target_player_id is None:
+                raise ValueError("Se requiere target_player_id")
+            if game_obj.turn_state.sfp_players is None:
+                game_obj.turn_state.sfp_players = []        
+            game_obj.turn_state.sfp_players = game_obj.turn_state.sfp_players + [str(target_player_id)]
+
+        else:
+            # Limpia estos campos si estamos en cualquier OTRO estado
+            game_obj.turn_state.passing_direction = None
+            game_obj.turn_state.current_event_card_id = None
+            game_obj.turn_state.card_trade_offered_card_id = None
+            game_obj.turn_state.is_canceled_card = None
+            game_obj.turn_state.last_is_canceled_card = None
+            game_obj.turn_state.vote_data = None
+            game_obj.turn_state.sfp_players = []
+
+        self.db.commit()
+    
+    def submit_player_vote(
+        self,
+        game_id: UUID,
+        voter_player_id: UUID,
+        voted_player_id: UUID
+    ):
+        """
+        Registra el voto de un jugador en el GameTurnState.
+        """
+        turn_state = self.get_turn_state_entity(game_id)
+        
+        if not turn_state or turn_state.state != TurnState.VOTING:
+            raise HTTPException(status_code=403, detail="Not in a voting phase")
+
+        if voter_player_id == voted_player_id:
+            raise HTTPException(status_code=400, detail="Cannot vote for oneself")
+
+        current_votes = turn_state.vote_data if turn_state.vote_data is not None else {}
+
+        if str(voter_player_id) in current_votes: 
+            raise HTTPException(status_code=403, detail="Player has already voted")
+
+        # Añadimos el nuevo voto
+        current_votes[str(voter_player_id)] = str(voted_player_id)
+        turn_state.vote_data = current_votes
+        
+        flag_modified(turn_state, "vote_data")
+
+        self.db.commit()
+
+    async def handler_end_timer(
+            self,
+            game_id: UUID
+    ):
+        game_obj = self.db.query(Game).filter(Game.id == game_id).first()
+        current_turn=game_obj.current_turn
+        if game_obj.turn_state.state != TurnState.END_TURN:
+            self.handle_end_timer_normal_state(
+                game_id,
+                current_turn
+            )
+
+            self.change_turn_state(game_id,TurnState.END_TURN)
+        result: Union[UUID, EndGameResult] = self.next_player(game_id)
+
+        if isinstance(result, EndGameResult):
+            await manager.broadcast_to_game(
+                game_id, {"type": "gameEnded", "data": jsonable_encoder(result)}
+            )
+            turn_timer_manager.stop_timer(game_id)
+        
+
+        else:
+            id_next_player = result
+            await manager.broadcast_to_game(
+                game_id, {"type" : "endTimer", 
+                          "data": {
+                              "player_id":str(current_turn)
+                          }}
+            )
+    
+            await manager.broadcast_to_game(
+                game_id, {"type" : "turnChange", 
+                          "data": {
+                              "player_id":str(id_next_player)
+                          }}
+            )
+            
+    def handle_end_timer_normal_state(
+            self, 
+            game_id: UUID, 
+            player_id: UUID
+    ): 
+        
+        hand_player = CardService.count_player_hand(
+            self.db,
+            game_id,
+            player_id
+        )
+
+        if hand_player == 6:
+            cards_player = CardService.get_cards_by_owner(
+                self.db,
+                game_id,
+                CardOwner.PLAYER,
+                player_id
+            )
+
+
+            move_in = CardMoveIn(to_owner=CardOwner.DISCARD_PILE)
+            CardService.move_card(self.db,
+                                  cards_player[0].id,
+                                  move_in)
+            CardService.moveDeckToPlayer(
+                self.db,
+                game_id,
+                player_id,
+                1)
+        else:
+            CardService.moveDeckToPlayer(
+                self.db,
+                game_id,
+                player_id,
+                (6-hand_player)
+            )
+
+
+    def get_player_neighbors(
+        self, 
+        game_id: UUID, 
+        player_id: UUID
+    ) -> tuple[Optional[Player], Optional[Player]]:
+        """
+        Encuentra al jugador anterior y al siguiente en el orden de turno (por UUID).
+        Devuelve una tupla (previous_player, next_player).
+        """
+        players = self.db.query(Player).filter(Player.game_id == game_id).all()
+
+        if not players or len(players) < 2:
+            return (None, None)
+
+        sorted_players = sorted(players, key=lambda p: p.id)
+
+        # Encontrar el índice del jugador actual
+        current_index = -1
+        for i, p in enumerate(sorted_players):
+            if p.id == player_id:
+                current_index = i
+                break
+        
+        if current_index == -1:
+            # El jugador que lo pide no está en el juego
+            return (None, None)
+
+        num_players = len(sorted_players)
+        
+        prev_index = (current_index - 1 + num_players) % num_players
+        
+        next_index = (current_index + 1) % num_players
+
+        return (sorted_players[prev_index], sorted_players[next_index])
+
+
+    def remove_player(self, game_id: UUID, player_id: UUID) -> bool:
+        """
+        Remueve un jugador de una partida que no ha comenzado.
+        Si el jugador es el host, elimina la partida completa.
+        Devuelve True si la operación fue exitosa (jugador removido o juego eliminado).
+        """
+        game = self.db.query(Game).filter(Game.id == game_id).first()
+        player_service = PlayerService(self.db)
+        
+        # Obtenemos la entidad del jugador
+        player_to_remove = player_service.get_player_entity_by_id(player_id)
+
+        if not game or not player_to_remove or player_to_remove.game_id != game_id:
+            # Juego no encontrado, jugador no encontrado, o jugador no está en este juego
+            return False
+
+        if game.ready:
+            # No se permite abandonar una partida ya iniciada 
+            return False 
+
+        if game.host_id == player_id:
+            self.db.delete(game)
+            self.db.commit()
+            return True
+        else:
+            self.db.delete(player_to_remove) 
+
+            self.db.commit()
+            return True
+    

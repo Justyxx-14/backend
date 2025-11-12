@@ -6,8 +6,8 @@ def test_cardowner_members_and_values():
     """CardOwner expone exactamente los dueños esperados del dominio."""
     names = {m.name for m in CardOwner}
     values = {m.value for m in CardOwner}
-    assert names == {"DECK", "DISCARD_PILE", "PLAYER", "DRAFT", "OUT_OFF_THE_GAME", "SET"}
-    assert values == {"DECK", "DISCARD_PILE", "PLAYER", "DRAFT", "OUT_OFF_THE_GAME", "SET"}
+    assert names == {"DECK", "DISCARD_PILE", "PLAYER", "DRAFT", "OUT_OFF_THE_GAME", "SET", "PASSING"}
+    assert values == {"DECK", "DISCARD_PILE", "PLAYER", "DRAFT", "OUT_OFF_THE_GAME", "SET", "PASSING"}
 
 def test_cardtype_has_event_at_least():
     """CardType incluye al menos EVENT (pueden existir otros tipos)."""

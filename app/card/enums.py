@@ -12,3 +12,4 @@ class CardOwner(str, Enum):
     DRAFT = "DRAFT"
     OUT_OFF_THE_GAME = "OUT_OFF_THE_GAME"
     SET = "SET"
+    PASSING = "PASSING"

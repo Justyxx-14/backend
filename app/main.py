@@ -8,6 +8,7 @@ from app.websocket.web_socket import router as ws_router
 from app.db import Base, engine
 from app.player.models import Player
 from app.game.models import Game
+from app.game.models import GameTurnState
 from app.card.models import Card
 from app.secret.models import Secrets
 from fastapi.middleware.cors import CORSMiddleware

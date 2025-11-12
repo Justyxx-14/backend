@@ -45,8 +45,6 @@
     { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
     { "type": "EVENT", "name": "E_NSF", "description": "Not so Fast" },
 
-    { "type": "DEVIOUS", "name": "DV_BLM", "description": "Blackmailed!" },
-    
     { "type": "DEVIOUS", "name": "DV_SFP", "description": "Social Faux Pas" },
     { "type": "DEVIOUS", "name": "DV_SFP", "description": "Social Faux Pas" },
     { "type": "DEVIOUS", "name": "DV_SFP", "description": "Social Faux Pas" },
@@ -54,10 +52,6 @@
     { "type": "EVENT", "name": "E_DME", "description": "Delay the Murderer's Escape" },
     { "type": "EVENT", "name": "E_DME", "description": "Delay the Murderer's Escape" },
     { "type": "EVENT", "name": "E_DME", "description": "Delay the Murderer's Escape" },
-
-    { "type": "EVENT", "name": "E_PYS", "description": "Point your Suspicions" },
-    { "type": "EVENT", "name": "E_PYS", "description": "Point your Suspicions" },
-    { "type": "EVENT", "name": "E_PYS", "description": "Point your Suspicions" },
 
     { "type": "EVENT", "name": "E_DCF", "description": "Dead Card Folly" },
     { "type": "EVENT", "name": "E_DCF", "description": "Dead Card Folly" },
